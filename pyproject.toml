@@ -1,0 +1,25 @@
+[project]
+name = "evenly-backend-service"
+version = "0.1.0"
+description = "Backend service for multi-person expense splitting app"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.133.1",
+    "uvicorn>=0.41.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "pydantic[email]>=2.0.0",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "python-multipart>=0.0.9",
+    "alembic>=1.13.0",
+    "pyyaml>=6.0.0",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]

@@ -1,0 +1,6 @@
+db:
+  host: 170.18.9.106
+  port: 5432
+  database: postgres
+  user: postgres
+  password: "Sudy.web123"
