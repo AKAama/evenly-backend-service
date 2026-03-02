@@ -14,14 +14,14 @@ cors:
   allow_methods: ["*"]
   allow_headers: ["*"]
 cos:
-  secret_id: "AKIDKflbATWJAk6C2cx2nMfiUzECwa3HFxPb"
-  secret_key: "ziBWbWCcolTxDF2bx540tYy95nHXXKr9"
+  secret_id: ""
+  secret_key: ""
   region: "ap-nanjing"
   bucket: "evenly-1325650734"
   cdn_domain: "cos.ismyh.cn"
 smtp:
-  secret_id: "AKIDvjNyObcT8bsxutkTMJ8mHZWHsIXbVI6k"
-  secret_key: "VvIZq23sY9mLqFTWRCmK0MdkoJiz54vc"
+  secret_id: ""
+  secret_key: ""
   from_email: "evenly-verification@ses.ismyh.cn"
   from_name: "evenly小助手"
   template_id: "165787"
