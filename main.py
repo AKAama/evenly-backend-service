@@ -1,6 +1,8 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import engine, Base
+from app.config import settings
 from app.routers import auth, ledgers, expenses, settlements, users
 
 # Create database tables
@@ -11,6 +13,16 @@ app = FastAPI(
     description="Backend API for collaborative expense tracking and settlement",
     version="1.0.0"
 )
+
+# CORS middleware
+if settings.cors:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors.allow_origins,
+        allow_credentials=settings.cors.allow_credentials,
+        allow_methods=settings.cors.allow_methods,
+        allow_headers=settings.cors.allow_headers,
+    )
 
 # Include routers
 app.include_router(auth.router)
@@ -28,3 +40,8 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=3000)

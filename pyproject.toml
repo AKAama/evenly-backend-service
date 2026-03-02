@@ -16,6 +16,8 @@ dependencies = [
     "python-multipart>=0.0.9",
     "alembic>=1.13.0",
     "pyyaml>=6.0.0",
+    "cos-python-sdk-v5>=1.9.0",
+    "requests>=2.31.0",
 ]
 
 [tool.uv]

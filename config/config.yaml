@@ -1,6 +1,27 @@
 db:
-  host: 170.18.9.106
+  host: 127.0.0.1
   port: 5432
   database: postgres
   user: postgres
   password: "Sudy.web123"
+jwt_secret_key: "aa9b51830c1f5ee07f1e3bb2c38486a19efb043aa3a441e9ea16874448a4fc6d"
+jwt_expire_minutes: 1440
+cors:
+  allow_origins:
+    - "http://localhost:3001"
+    - "http://evenly.ismyh.cn"
+  allow_credentials: true
+  allow_methods: ["*"]
+  allow_headers: ["*"]
+cos:
+  secret_id: "AKIDKflbATWJAk6C2cx2nMfiUzECwa3HFxPb"
+  secret_key: "ziBWbWCcolTxDF2bx540tYy95nHXXKr9"
+  region: "ap-nanjing"
+  bucket: "evenly-1325650734"
+  cdn_domain: "cos.ismyh.cn"
+smtp:
+  secret_id: "AKIDvjNyObcT8bsxutkTMJ8mHZWHsIXbVI6k"
+  secret_key: "VvIZq23sY9mLqFTWRCmK0MdkoJiz54vc"
+  from_email: "evenly-verification@ses.ismyh.cn"
+  from_name: "evenly小助手"
+  template_id: "165787"

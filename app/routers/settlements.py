@@ -74,7 +74,7 @@ def get_settlement_history(
     if not membership:
         raise HTTPException(status_code=403, detail="Not a member of this ledger")
 
-    settlements = db.query(Settlement).filter(Settlement.ledger_id == ledger_id).all()
+    settlements = db.query(Settlement).filter(Settlement.ledger_id == ledger_id).order_by(Settlement.settled_at.desc()).all()
 
     result = []
     for s in settlements:

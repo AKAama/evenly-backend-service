@@ -12,6 +12,8 @@ from app.schemas.expense import (
     ExpenseWithDetails,
     ExpenseSplitCreate,
     ConfirmExpenseRequest,
+    ExpenseSplitResponse,
+    ExpenseConfirmationResponse,
 )
 from app.schemas.user import UserResponse
 from app.utils.deps import get_current_user
@@ -99,7 +101,7 @@ def get_expenses(
     if not membership:
         raise HTTPException(status_code=403, detail="Not a member of this ledger")
 
-    expenses = db.query(Expense).filter(Expense.ledger_id == ledger_id).all()
+    expenses = db.query(Expense).filter(Expense.ledger_id == ledger_id).order_by(Expense.created_at.desc()).all()
 
     result = []
     for exp in expenses:
@@ -191,6 +193,7 @@ def confirm_expense(
         status=request.status,
     )
     db.add(confirmation)
+    db.flush()  # Flush to get the new confirmation in the query
 
     # Check if all members have confirmed
     if request.status == "confirmed":
@@ -247,10 +250,6 @@ def delete_expense(
     db.delete(expense)
     db.commit()
     return None
-
-
-# Add missing response models for the expense response
-from app.schemas.expense import ExpenseSplitResponse
 
 
 @router.get("/{expense_id}", response_model=ExpenseWithDetails)
