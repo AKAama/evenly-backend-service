@@ -57,3 +57,4 @@ htmlcov/
 
 # Alembic
 alembic/versions/*.py
+/.claude/settings.local.json
