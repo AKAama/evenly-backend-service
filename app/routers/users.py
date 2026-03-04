@@ -5,9 +5,10 @@ from typing import List
 
 from app.database import get_db
 from app.models import User
-from app.schemas.user import UserResponse
+from app.schemas.user import UserResponse, UserUpdate, PasswordChange
 from app.utils.deps import get_current_user
 from app.services.cos import get_cos_service
+from app.services.auth import verify_password, get_password_hash
 from app.config import settings
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -84,3 +85,41 @@ def search_users(
 
     # Exclude current user from results
     return [u for u in query if u.id != current_user.id]
+
+
+@router.put("/me", response_model=UserResponse)
+def update_user_info(
+    user_update: UserUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update current user information (display_name)"""
+    if user_update.display_name is not None:
+        current_user.display_name = user_update.display_name
+    if user_update.avatar_url is not None:
+        current_user.avatar_url = user_update.avatar_url
+
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
+@router.put("/me/password")
+def change_password(
+    password_change: PasswordChange,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Change user password"""
+    # Verify old password
+    if not verify_password(password_change.old_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Incorrect old password"
+        )
+
+    # Update password
+    current_user.password_hash = get_password_hash(password_change.new_password)
+    db.commit()
+
+    return {"message": "Password updated successfully"}

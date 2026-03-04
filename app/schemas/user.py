@@ -33,3 +33,13 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     user_id: UUID | None = None
+
+
+class UserUpdate(BaseModel):
+    display_name: str | None = None
+    avatar_url: str | None = None
+
+
+class PasswordChange(BaseModel):
+    old_password: str
+    new_password: str
