@@ -10,15 +10,20 @@ from app.schemas.expense import (
     ExpenseCreate,
     ExpenseResponse,
     ExpenseWithDetails,
-    ExpenseSplitCreate,
     ConfirmExpenseRequest,
     ExpenseSplitResponse,
     ExpenseConfirmationResponse,
 )
 from app.schemas.user import UserResponse
-from app.utils.deps import get_current_user
+from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
+
+CENT = Decimal("0.01")
+
+
+def normalize_money(value: Decimal) -> Decimal:
+    return value.quantize(CENT)
 
 
 @router.post("/ledgers/{ledger_id}/expenses", response_model=ExpenseResponse, status_code=status.HTTP_201_CREATED)
@@ -30,24 +35,39 @@ def create_expense(
 ):
     """Create a new expense in a ledger"""
     # Check if ledger exists and user is a member
-    ledger = db.query(Ledger).filter(Ledger.id == ledger_id).first()
-    if not ledger:
-        raise HTTPException(status_code=404, detail="Ledger not found")
+    get_ledger_or_404(db, ledger_id)
+    require_ledger_member(db, ledger_id, current_user)
 
-    membership = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-        LedgerMember.user_id == current_user.id
-    ).first()
+    if expense.total_amount <= 0:
+        raise HTTPException(status_code=400, detail="Expense amount must be greater than zero")
 
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not a member of this ledger")
+    if not expense.splits:
+        raise HTTPException(status_code=400, detail="At least one split is required")
+
+    member_ids = {
+        m.user_id
+        for m in db.query(LedgerMember).filter(LedgerMember.ledger_id == ledger_id).all()
+        if m.user_id is not None and not m.is_temporary
+    }
+
+    split_user_ids = [s.user_id for s in expense.splits]
+    if len(split_user_ids) != len(set(split_user_ids)):
+        raise HTTPException(status_code=400, detail="Duplicate users in splits are not allowed")
+
+    if expense.payer_id not in member_ids:
+        raise HTTPException(status_code=400, detail="Payer must be a registered ledger member")
+
+    invalid_split_ids = set(split_user_ids) - member_ids
+    if invalid_split_ids:
+        raise HTTPException(status_code=400, detail="All split users must be registered ledger members")
 
     # Validate splits total equals expense total
-    split_total = sum(s.amount for s in expense.splits)
-    if split_total != expense.total_amount:
+    split_total = normalize_money(sum(s.amount for s in expense.splits))
+    expense_total = normalize_money(expense.total_amount)
+    if split_total != expense_total:
         raise HTTPException(
             status_code=400,
-            detail=f"Split total ({split_total}) must equal expense amount ({expense.total_amount})"
+            detail=f"Split total ({split_total}) must equal expense amount ({expense_total})"
         )
 
     # Validate payer is in splits
@@ -93,13 +113,7 @@ def get_expenses(
 ):
     """Get all expenses in a ledger"""
     # Check if user is a member
-    membership = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-        LedgerMember.user_id == current_user.id
-    ).first()
-
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not a member of this ledger")
+    require_ledger_member(db, ledger_id, current_user)
 
     expenses = db.query(Expense).filter(Expense.ledger_id == ledger_id).order_by(Expense.created_at.desc()).all()
 
@@ -161,13 +175,14 @@ def confirm_expense(
         raise HTTPException(status_code=404, detail="Expense not found")
 
     # Check if user is a member of the ledger
-    membership = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == expense.ledger_id,
-        LedgerMember.user_id == current_user.id
-    ).first()
+    require_ledger_member(db, expense.ledger_id, current_user)
 
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not a member of this ledger")
+    split_participants = {
+        s.user_id
+        for s in db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == expense_id).all()
+    }
+    if current_user.id not in split_participants:
+        raise HTTPException(status_code=403, detail="Only expense participants can confirm this expense")
 
     # Check if already confirmed or rejected
     if expense.status != ExpenseStatus.PENDING:
@@ -198,17 +213,13 @@ def confirm_expense(
     # Check if all members have confirmed
     if request.status == "confirmed":
         # Check if all members have now confirmed
-        members = db.query(LedgerMember).filter(LedgerMember.ledger_id == expense.ledger_id).all()
-        member_ids = [m.user_id for m in members]
-
         confirmations = db.query(ExpenseConfirmation).filter(
             ExpenseConfirmation.expense_id == expense_id,
             ExpenseConfirmation.status == "confirmed"
         ).all()
-        confirmed_ids = [c.user_id for c in confirmations]
+        confirmed_ids = {c.user_id for c in confirmations}
 
-        # All members must confirm
-        if set(member_ids) == set(confirmed_ids):
+        if split_participants <= confirmed_ids:
             expense.status = ExpenseStatus.CONFIRMED
 
     elif request.status == "rejected":
@@ -264,13 +275,7 @@ def get_expense(
         raise HTTPException(status_code=404, detail="Expense not found")
 
     # Check if user is a member
-    membership = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == expense.ledger_id,
-        LedgerMember.user_id == current_user.id
-    ).first()
-
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not a member of this ledger")
+    require_ledger_member(db, expense.ledger_id, current_user)
 
     payer = db.query(User).filter(User.id == expense.payer_id).first()
     splits = db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == expense.id).all()

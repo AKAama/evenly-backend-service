@@ -11,20 +11,31 @@ from app.schemas.ledger import (
     LedgerWithMembers,
     AddMemberRequest,
     MemberResponse,
+    MemberCreate,
 )
 from app.schemas.user import UserResponse
-from app.utils.deps import get_current_user
+from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 
 router = APIRouter(prefix="/ledgers", tags=["ledgers"])
 
 
-@router.post("", response_model=LedgerResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=LedgerWithMembers, status_code=status.HTTP_201_CREATED)
 def create_ledger(
     ledger: LedgerCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """Create a new ledger and add the creator as owner member"""
+    
+    # Check if ledger name already exists for this user
+    existing = db.query(Ledger).filter(
+        Ledger.name == ledger.name,
+        Ledger.owner_id == current_user.id
+    ).first()
+    
+    if existing:
+        raise HTTPException(status_code=400, detail="账本名称已存在，请使用其他名称")
+    
     db_ledger = Ledger(
         name=ledger.name,
         owner_id=current_user.id,
@@ -35,15 +46,86 @@ def create_ledger(
     db.refresh(db_ledger)
 
     # Add creator as a member
-    member = LedgerMember(
+    owner_member = LedgerMember(
         ledger_id=db_ledger.id,
         user_id=current_user.id,
         nickname=current_user.display_name,
     )
-    db.add(member)
+    db.add(owner_member)
+    db.flush()
+    db.refresh(owner_member)
+
+    # Add initial members from request (if any)
+    member_responses = []
+    for member_data in ledger.members:
+        # Handle temporary members
+        if member_data.is_temporary:
+            if not member_data.temporary_name:
+                continue
+            member = LedgerMember(
+                ledger_id=db_ledger.id,
+                user_id=None,
+                nickname=member_data.temporary_name,
+                is_temporary=True,
+                temporary_name=member_data.temporary_name,
+            )
+        else:
+            # Regular member - must have user_id
+            if not member_data.user_id:
+                continue
+            # Check if user exists
+            user = db.query(User).filter(User.id == member_data.user_id).first()
+            if not user:
+                continue
+            member = LedgerMember(
+                ledger_id=db_ledger.id,
+                user_id=member_data.user_id,
+                nickname=member_data.nickname or user.display_name,
+            )
+        
+        db.add(member)
+        db.commit()
+        db.refresh(member)
+        
+        # Build member response
+        member_user = db.query(User).filter(User.id == member.user_id).first() if member.user_id and not member.is_temporary else None
+        member_responses.append(MemberResponse(
+            id=member.id,
+            user_id=member.user_id,
+            nickname=member.nickname,
+            joined_at=member.joined_at,
+            user=UserResponse.model_validate(member_user) if member_user else None,
+            is_temporary=member.is_temporary,
+            temporary_name=member.temporary_name
+        ))
+
     db.commit()
 
-    return db_ledger
+    # Build response with all members including owner
+    owner_user_response = UserResponse.model_validate(current_user)
+    owner_member_response = MemberResponse(
+        id=owner_member.id,
+        user_id=current_user.id,
+        nickname=current_user.display_name,
+        joined_at=owner_member.joined_at,
+        user=owner_user_response,
+        is_temporary=False,
+        temporary_name=None
+    )
+    
+    all_members = [owner_member_response] + member_responses
+    
+    response = LedgerWithMembers(
+        id=db_ledger.id,
+        name=db_ledger.name,
+        owner_id=db_ledger.owner_id,
+        currency=db_ledger.currency,
+        created_at=db_ledger.created_at,
+        updated_at=db_ledger.updated_at,
+        members=all_members
+    )
+    
+    return response
 
 
 @router.get("", response_model=List[LedgerResponse])
@@ -66,29 +148,22 @@ def get_ledger(
     current_user: User = Depends(get_current_user)
 ):
     """Get ledger details with members"""
-    ledger = db.query(Ledger).filter(Ledger.id == ledger_id).first()
-    if not ledger:
-        raise HTTPException(status_code=404, detail="Ledger not found")
-
-    # Check if user is a member
-    membership = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-        LedgerMember.user_id == current_user.id
-    ).first()
-
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not a member of this ledger")
+    ledger = get_ledger_or_404(db, ledger_id)
+    require_ledger_member(db, ledger_id, current_user)
 
     # Get members with user details
     members = db.query(LedgerMember).filter(LedgerMember.ledger_id == ledger_id).all()
     member_responses = []
     for m in members:
-        user = db.query(User).filter(User.id == m.user_id).first()
+        user = db.query(User).filter(User.id == m.user_id).first() if m.user_id and not m.is_temporary else None
         member_responses.append(MemberResponse(
+            id=m.id,
             user_id=m.user_id,
             nickname=m.nickname,
             joined_at=m.joined_at,
-            user=UserResponse.model_validate(user)
+            user=UserResponse.model_validate(user) if user else None,
+            is_temporary=m.is_temporary,
+            temporary_name=m.temporary_name
         ))
 
     response = LedgerWithMembers.model_validate(ledger)
@@ -103,9 +178,7 @@ def delete_ledger(
     current_user: User = Depends(get_current_user)
 ):
     """Delete a ledger (only owner can delete)"""
-    ledger = db.query(Ledger).filter(Ledger.id == ledger_id).first()
-    if not ledger:
-        raise HTTPException(status_code=404, detail="Ledger not found")
+    ledger = get_ledger_or_404(db, ledger_id)
 
     if ledger.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only owner can delete the ledger")
@@ -125,22 +198,62 @@ def add_member(
     current_user: User = Depends(get_current_user)
 ):
     """Add a member to the ledger (only owner can add)"""
-    ledger = db.query(Ledger).filter(Ledger.id == ledger_id).first()
-    if not ledger:
-        raise HTTPException(status_code=404, detail="Ledger not found")
+    ledger = get_ledger_or_404(db, ledger_id)
 
     if ledger.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only owner can add members")
+
+    # Handle temporary members
+    if request.is_temporary:
+        if not request.temporary_name:
+            raise HTTPException(status_code=400, detail="Temporary name is required")
+        
+        # Check if temporary member already exists
+        existing = db.query(LedgerMember).filter(
+            LedgerMember.ledger_id == ledger_id,
+            LedgerMember.is_temporary == True,
+            LedgerMember.temporary_name == request.temporary_name
+        ).first()
+
+        if existing:
+            raise HTTPException(status_code=400, detail="Temporary member already exists")
+
+        member = LedgerMember(
+            ledger_id=ledger_id,
+            user_id=None,
+            nickname=request.temporary_name,
+            is_temporary=True,
+            temporary_name=request.temporary_name,
+        )
+        db.add(member)
+        db.commit()
+        db.refresh(member)
+
+        return MemberResponse(
+            id=member.id,
+            user_id=member.user_id,
+            nickname=member.nickname,
+            joined_at=member.joined_at,
+            user=None,
+            is_temporary=True,
+            temporary_name=member.temporary_name
+        )
+
+    # Handle regular members
+    if not request.user_id:
+        raise HTTPException(status_code=400, detail="User ID is required for non-temporary members")
 
     # Check if user exists
     user = db.query(User).filter(User.id == request.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Check if already a member
+    # Check if already a member (regular or temporary)
     existing = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-        LedgerMember.user_id == request.user_id
+        LedgerMember.ledger_id == ledger_id
+    ).filter(
+        (LedgerMember.user_id == request.user_id) | 
+        ((LedgerMember.is_temporary == True) & (LedgerMember.temporary_name == request.nickname))
     ).first()
 
     if existing:
@@ -157,10 +270,13 @@ def add_member(
     db.refresh(member)
 
     return MemberResponse(
+        id=member.id,
         user_id=member.user_id,
         nickname=member.nickname,
         joined_at=member.joined_at,
-        user=UserResponse.model_validate(user)
+        user=UserResponse.model_validate(user),
+        is_temporary=False,
+        temporary_name=None
     )
 
 
@@ -171,24 +287,20 @@ def get_members(
     current_user: User = Depends(get_current_user)
 ):
     """Get all members of a ledger"""
-    # Check if user is a member
-    membership = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-        LedgerMember.user_id == current_user.id
-    ).first()
-
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not a member of this ledger")
+    require_ledger_member(db, ledger_id, current_user)
 
     members = db.query(LedgerMember).filter(LedgerMember.ledger_id == ledger_id).all()
     result = []
     for m in members:
-        user = db.query(User).filter(User.id == m.user_id).first()
+        user = db.query(User).filter(User.id == m.user_id).first() if m.user_id and not m.is_temporary else None
         result.append(MemberResponse(
+            id=m.id,
             user_id=m.user_id,
             nickname=m.nickname,
             joined_at=m.joined_at,
-            user=UserResponse.model_validate(user)
+            user=UserResponse.model_validate(user) if user else None,
+            is_temporary=m.is_temporary,
+            temporary_name=m.temporary_name
         ))
     return result
 
@@ -201,9 +313,7 @@ def remove_member(
     current_user: User = Depends(get_current_user)
 ):
     """Remove a member from ledger (owner can remove others, members can remove themselves)"""
-    ledger = db.query(Ledger).filter(Ledger.id == ledger_id).first()
-    if not ledger:
-        raise HTTPException(status_code=404, detail="Ledger not found")
+    ledger = get_ledger_or_404(db, ledger_id)
 
     membership = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger_id,
@@ -233,9 +343,7 @@ def leave_ledger(
     current_user: User = Depends(get_current_user)
 ):
     """Current user leaves the ledger (non-owner only)"""
-    ledger = db.query(Ledger).filter(Ledger.id == ledger_id).first()
-    if not ledger:
-        raise HTTPException(status_code=404, detail="Ledger not found")
+    ledger = get_ledger_or_404(db, ledger_id)
 
     if ledger.owner_id == current_user.id:
         raise HTTPException(status_code=400, detail="Owner cannot leave, must delete ledger")

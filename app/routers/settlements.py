@@ -13,7 +13,7 @@ from app.schemas.settlement import (
 )
 from app.schemas.user import UserResponse
 from app.services.settlement import SettlementCalculator, create_settlement_record
-from app.utils.deps import get_current_user
+from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 
 router = APIRouter(prefix="/ledgers", tags=["settlements"])
 
@@ -26,17 +26,8 @@ def get_settlements(
 ):
     """Calculate and return settlement instructions for a ledger"""
     # Check if ledger exists and user is a member
-    ledger = db.query(Ledger).filter(Ledger.id == ledger_id).first()
-    if not ledger:
-        raise HTTPException(status_code=404, detail="Ledger not found")
-
-    membership = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-        LedgerMember.user_id == current_user.id
-    ).first()
-
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not a member of this ledger")
+    get_ledger_or_404(db, ledger_id)
+    require_ledger_member(db, ledger_id, current_user)
 
     # Calculate settlements
     calculator = SettlementCalculator(db, ledger_id)
@@ -62,17 +53,8 @@ def get_settlement_history(
 ):
     """Get settlement history for a ledger"""
     # Check if ledger exists and user is a member
-    ledger = db.query(Ledger).filter(Ledger.id == ledger_id).first()
-    if not ledger:
-        raise HTTPException(status_code=404, detail="Ledger not found")
-
-    membership = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-        LedgerMember.user_id == current_user.id
-    ).first()
-
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not a member of this ledger")
+    get_ledger_or_404(db, ledger_id)
+    require_ledger_member(db, ledger_id, current_user)
 
     settlements = db.query(Settlement).filter(Settlement.ledger_id == ledger_id).order_by(Settlement.settled_at.desc()).all()
 
@@ -105,27 +87,26 @@ def create_settlement(
 ):
     """Record a settlement (payment)"""
     # Check if ledger exists and user is a member
-    ledger = db.query(Ledger).filter(Ledger.id == ledger_id).first()
-    if not ledger:
-        raise HTTPException(status_code=404, detail="Ledger not found")
+    get_ledger_or_404(db, ledger_id)
+    require_ledger_member(db, ledger_id, current_user)
 
-    membership = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-        LedgerMember.user_id == current_user.id
-    ).first()
+    if settlement.from_user_id == settlement.to_user_id:
+        raise HTTPException(status_code=400, detail="Settlement users must be different")
 
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not a member of this ledger")
+    if settlement.amount <= 0:
+        raise HTTPException(status_code=400, detail="Settlement amount must be greater than zero")
 
     # Validate from_user and to_user are members
     from_member = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger_id,
-        LedgerMember.user_id == settlement.from_user_id
+        LedgerMember.user_id == settlement.from_user_id,
+        LedgerMember.is_temporary.is_(False)
     ).first()
 
     to_member = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger_id,
-        LedgerMember.user_id == settlement.to_user_id
+        LedgerMember.user_id == settlement.to_user_id,
+        LedgerMember.is_temporary.is_(False)
     ).first()
 
     if not from_member or not to_member:
