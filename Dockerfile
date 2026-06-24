@@ -21,7 +21,8 @@ COPY pyproject.toml ./
 RUN pip install --upgrade pip && pip install .
 
 COPY app/ ./app/
-COPY alembic.ini alembic/ ./
+COPY alembic.ini ./
+COPY alembic/ ./alembic/
 COPY main.py ./
 RUN chown -R appuser /app
 
