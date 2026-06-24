@@ -1,8 +1,8 @@
-import os
 import yaml
 from pathlib import Path
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class DatabaseConfig(BaseModel):
@@ -42,13 +42,20 @@ class SMTPConfig(BaseModel):
 class CORSConfig(BaseModel):
     allow_origins: List[str]
     allow_credentials: bool = True
-    allow_methods: List[str] = ["*"]
-    allow_headers: List[str] = ["*"]
+    allow_methods: List[str] = Field(default_factory=lambda: ["*"])
+    allow_headers: List[str] = Field(default_factory=lambda: ["*"])
 
 
-class Settings(BaseModel):
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_nested_delimiter="__",
+        extra="ignore",
+    )
+
     # Database
     db: DatabaseConfig
+    database_url_override: Optional[str] = Field(default=None, validation_alias="DATABASE_URL")
 
     # CORS
     cors: Optional[CORSConfig] = None
@@ -59,13 +66,24 @@ class Settings(BaseModel):
     # SMTP (Email)
     smtp: Optional[SMTPConfig] = None
 
+    # Redis-backed verification codes and rate limits. If unset, the app uses
+    # in-memory storage for local development.
+    redis_url: Optional[str] = Field(default=None, validation_alias="REDIS_URL")
+    verification_code_expire_seconds: int = 600
+    verification_send_interval_seconds: int = 60
+
     # JWT
     jwt_secret_key: str = "your-secret-key-change-in-production"
     jwt_expire_minutes: int = 60 * 24  # 24 hours
     algorithm: str = "HS256"
+    auth_cookie_name: str = "evenly_access_token"
+    auth_cookie_secure: bool = False
+    auth_cookie_samesite: str = "lax"
 
     @property
     def database_url(self) -> str:
+        if self.database_url_override:
+            return self.database_url_override
         return self.db.url
 
 
@@ -74,7 +92,7 @@ def load_settings() -> Settings:
     if config_path.exists():
         with open(config_path, "r") as f:
             config_data = yaml.safe_load(f)
-        return Settings(**config_data)
+        return Settings(**(config_data or {}))
     # Fallback to default
     return Settings(
         db=DatabaseConfig(

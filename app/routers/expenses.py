@@ -54,6 +54,9 @@ def create_expense(
     if len(split_user_ids) != len(set(split_user_ids)):
         raise HTTPException(status_code=400, detail="Duplicate users in splits are not allowed")
 
+    if any(split.amount <= 0 for split in expense.splits):
+        raise HTTPException(status_code=400, detail="Split amounts must be greater than zero")
+
     if expense.payer_id not in member_ids:
         raise HTTPException(status_code=400, detail="Payer must be a registered ledger member")
 

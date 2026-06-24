@@ -1,18 +1,38 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+import logging
 
-from app.database import engine, Base
+from fastapi import FastAPI
+from fastapi import HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.config import settings
+from app.database import engine
 from app.routers import auth, ledgers, expenses, settlements, users
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Evenly - Multi-person Expense Splitting App",
     description="Backend API for collaborative expense tracking and settlement",
     version="1.0.0"
 )
+
+
+@app.exception_handler(SQLAlchemyError)
+async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
+    logger.exception(
+        "Database error while handling %s %s",
+        request.method,
+        request.url.path,
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database is not ready"},
+    )
 
 # CORS middleware
 if settings.cors:
@@ -40,6 +60,18 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+@app.get("/ready")
+async def readiness_check():
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("select 1"))
+    except SQLAlchemyError as exc:
+        logger.exception("Database readiness check failed", exc_info=exc)
+        raise HTTPException(status_code=503, detail="Database is not ready") from exc
+
+    return {"status": "ready"}
 
 
 if __name__ == "__main__":

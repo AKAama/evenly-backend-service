@@ -1,6 +1,17 @@
 import uuid
 from datetime import datetime, date
-from sqlalchemy import Column, String, Numeric, Text, Date, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    String,
+    Numeric,
+    Text,
+    Date,
+    DateTime,
+    ForeignKey,
+    Enum as SQLEnum,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 import enum
@@ -16,6 +27,9 @@ class ExpenseStatus(str, enum.Enum):
 
 class Expense(Base):
     __tablename__ = "expenses"
+    __table_args__ = (
+        CheckConstraint("total_amount > 0", name="ck_expenses_total_amount_positive"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     ledger_id = Column(UUID(as_uuid=True), ForeignKey("ledgers.id", ondelete="CASCADE"), nullable=False)
@@ -39,6 +53,10 @@ class Expense(Base):
 
 class ExpenseSplit(Base):
     __tablename__ = "expense_splits"
+    __table_args__ = (
+        UniqueConstraint("expense_id", "user_id", name="uq_expense_splits_expense_user"),
+        CheckConstraint("amount > 0", name="ck_expense_splits_amount_positive"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     expense_id = Column(UUID(as_uuid=True), ForeignKey("expenses.id", ondelete="CASCADE"), nullable=False)
@@ -53,6 +71,10 @@ class ExpenseSplit(Base):
 
 class ExpenseConfirmation(Base):
     __tablename__ = "expense_confirmations"
+    __table_args__ = (
+        UniqueConstraint("expense_id", "user_id", name="uq_expense_confirmations_expense_user"),
+        CheckConstraint("status in ('confirmed', 'rejected')", name="ck_expense_confirmations_status"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     expense_id = Column(UUID(as_uuid=True), ForeignKey("expenses.id", ondelete="CASCADE"), nullable=False)

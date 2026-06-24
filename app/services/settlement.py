@@ -80,6 +80,18 @@ class SettlementCalculator:
             paid = paid_dict.get(member.user_id, Decimal("0"))
             net_balances[member.user_id] = paid - owed
 
+        recorded_settlements = (
+            self.db.query(Settlement)
+            .filter(Settlement.ledger_id == self.ledger_id)
+            .all()
+        )
+        for settlement in recorded_settlements:
+            amount = Decimal(str(settlement.amount or 0))
+            if settlement.from_user_id in net_balances:
+                net_balances[settlement.from_user_id] += amount
+            if settlement.to_user_id in net_balances:
+                net_balances[settlement.to_user_id] -= amount
+
         return net_balances
 
     def get_user_names(self) -> dict[UUID, str]:

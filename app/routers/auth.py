@@ -1,6 +1,6 @@
 import logging
 from datetime import timedelta
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Response, status, UploadFile, File, Form
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from typing import Annotated
@@ -30,6 +30,29 @@ class SendCodeRequest(BaseModel):
 class VerifyCodeRequest(BaseModel):
     email: EmailStr
     code: str
+
+
+def set_auth_cookie(response: Response, access_token: str) -> None:
+    max_age = settings.jwt_expire_minutes * 60
+    response.set_cookie(
+        key=settings.auth_cookie_name,
+        value=access_token,
+        max_age=max_age,
+        httponly=True,
+        secure=settings.auth_cookie_secure,
+        samesite=settings.auth_cookie_samesite,
+        path="/",
+    )
+
+
+def clear_auth_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=settings.auth_cookie_name,
+        httponly=True,
+        secure=settings.auth_cookie_secure,
+        samesite=settings.auth_cookie_samesite,
+        path="/",
+    )
 
 
 @router.post("/send-verification")
@@ -64,6 +87,7 @@ def verify(email: str, code: str):
 
 @router.post("/register", response_model=RegisterResponse)
 async def register(
+    response: Response,
     email: Annotated[str, Form()],
     password: Annotated[str, Form()],
     code: Annotated[str, Form()],
@@ -147,6 +171,7 @@ async def register(
         data={"sub": str(db_user.id)},
         expires_delta=timedelta(minutes=settings.jwt_expire_minutes)
     )
+    set_auth_cookie(response, access_token)
 
     # Convert to response model
     user_response = UserResponse.model_validate(db_user)
@@ -158,6 +183,7 @@ async def register(
 
 @router.post("/login", response_model=Token)
 def login(
+    response: Response,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
@@ -175,5 +201,12 @@ def login(
         data={"sub": str(user.id)},
         expires_delta=timedelta(minutes=settings.jwt_expire_minutes)
     )
+    set_auth_cookie(response, access_token)
 
     return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.post("/logout")
+def logout(response: Response):
+    clear_auth_cookie(response)
+    return {"message": "Logged out"}

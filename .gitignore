@@ -36,6 +36,7 @@ env/
 # Environment variables
 .env
 .env.local
+config/config.yaml
 
 # Database
 *.db
@@ -55,6 +56,4 @@ Thumbs.db
 htmlcov/
 .tox/
 
-# Alembic
-alembic/versions/*.py
 /.claude/settings.local.json

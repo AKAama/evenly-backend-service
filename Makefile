@@ -76,3 +76,48 @@ info:
 	@echo "IMAGE_REPO: $(IMAGE_REPO)"
 	@echo "APP_NAME: $(APP_NAME)"
 	@echo "TAG: $(TAG)"
+
+.PHONY: db-upgrade
+db-upgrade:
+	uv run python -m alembic upgrade head
+
+.PHONY: db-downgrade
+db-downgrade:
+	uv run python -m alembic downgrade -1
+
+.PHONY: db-revision
+db-revision:
+	uv run python -m alembic revision --autogenerate -m "$(m)"
+
+.PHONY: dev-db-up
+dev-db-up: check-docker
+	docker compose up -d postgres redis
+
+.PHONY: dev-db-down
+dev-db-down: check-docker
+	docker compose down
+
+.PHONY: dev-db-reset
+dev-db-reset: check-docker
+	docker compose down -v
+	docker compose up -d postgres redis
+	uv run python -m alembic upgrade head
+
+.PHONY: dev-api
+dev-api:
+	uv run python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+.PHONY: doctor
+doctor:
+	uv run python - <<'PY'
+	from app.config import settings
+	from app.database import engine
+	print(f"DATABASE_URL: {settings.database_url}")
+	with engine.connect() as conn:
+	    print(f"database: {conn.exec_driver_sql('select current_database()').scalar()}")
+	    print("connection: ok")
+	PY
+
+.PHONY: check-docker
+check-docker:
+	@docker info >/dev/null 2>&1 || (echo "Docker is not running. Start Docker Desktop and try again." && exit 1)

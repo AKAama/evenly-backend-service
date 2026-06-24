@@ -1,10 +1,11 @@
+import logging
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List
 
 from app.database import get_db
-from app.models import User, Ledger, LedgerMember
+from app.models import User, Ledger, LedgerMember, Expense, ExpenseSplit, Settlement
 from app.schemas.ledger import (
     LedgerCreate,
     LedgerResponse,
@@ -17,6 +18,7 @@ from app.schemas.user import UserResponse
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 
 router = APIRouter(prefix="/ledgers", tags=["ledgers"])
+logger = logging.getLogger(__name__)
 
 
 @router.post("", response_model=LedgerWithMembers, status_code=status.HTTP_201_CREATED)
@@ -26,6 +28,12 @@ def create_ledger(
     current_user: User = Depends(get_current_user)
 ):
     """Create a new ledger and add the creator as owner member"""
+    logger.info(
+        "Creating ledger name=%s owner_id=%s initial_members=%d",
+        ledger.name,
+        current_user.id,
+        len(ledger.members),
+    )
     
     # Check if ledger name already exists for this user
     existing = db.query(Ledger).filter(
@@ -199,13 +207,28 @@ def add_member(
 ):
     """Add a member to the ledger (only owner can add)"""
     ledger = get_ledger_or_404(db, ledger_id)
+    logger.info(
+        "Adding ledger member ledger_id=%s actor_id=%s user_id=%s is_temporary=%s temporary_name=%s",
+        ledger_id,
+        current_user.id,
+        request.user_id,
+        request.is_temporary,
+        request.temporary_name,
+    )
 
     if ledger.owner_id != current_user.id:
+        logger.warning(
+            "Non-owner add member attempt ledger_id=%s actor_id=%s owner_id=%s",
+            ledger_id,
+            current_user.id,
+            ledger.owner_id,
+        )
         raise HTTPException(status_code=403, detail="Only owner can add members")
 
     # Handle temporary members
     if request.is_temporary:
         if not request.temporary_name:
+            logger.warning("Temporary member add missing name ledger_id=%s actor_id=%s", ledger_id, current_user.id)
             raise HTTPException(status_code=400, detail="Temporary name is required")
         
         # Check if temporary member already exists
@@ -216,6 +239,11 @@ def add_member(
         ).first()
 
         if existing:
+            logger.info(
+                "Duplicate temporary member add rejected ledger_id=%s temporary_name=%s",
+                ledger_id,
+                request.temporary_name,
+            )
             raise HTTPException(status_code=400, detail="Temporary member already exists")
 
         member = LedgerMember(
@@ -228,6 +256,7 @@ def add_member(
         db.add(member)
         db.commit()
         db.refresh(member)
+        logger.info("Added temporary member ledger_id=%s member_id=%s", ledger_id, member.id)
 
         return MemberResponse(
             id=member.id,
@@ -241,11 +270,13 @@ def add_member(
 
     # Handle regular members
     if not request.user_id:
+        logger.warning("Regular member add missing user_id ledger_id=%s actor_id=%s", ledger_id, current_user.id)
         raise HTTPException(status_code=400, detail="User ID is required for non-temporary members")
 
     # Check if user exists
     user = db.query(User).filter(User.id == request.user_id).first()
     if not user:
+        logger.warning("Regular member add user not found ledger_id=%s user_id=%s", ledger_id, request.user_id)
         raise HTTPException(status_code=404, detail="User not found")
 
     # Check if already a member (regular or temporary)
@@ -257,6 +288,7 @@ def add_member(
     ).first()
 
     if existing:
+        logger.info("Duplicate regular member add rejected ledger_id=%s user_id=%s", ledger_id, request.user_id)
         raise HTTPException(status_code=400, detail="User is already a member")
 
     # Add member
@@ -268,6 +300,7 @@ def add_member(
     db.add(member)
     db.commit()
     db.refresh(member)
+    logger.info("Added regular member ledger_id=%s member_id=%s user_id=%s", ledger_id, member.id, request.user_id)
 
     return MemberResponse(
         id=member.id,
@@ -305,35 +338,28 @@ def get_members(
     return result
 
 
-@router.delete("/{ledger_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_member(
-    ledger_id: UUID,
-    user_id: UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Remove a member from ledger (owner can remove others, members can remove themselves)"""
-    ledger = get_ledger_or_404(db, ledger_id)
+def ensure_member_can_be_removed(db: Session, ledger_id: UUID, user_id: UUID):
+    """Preserve historical expense and settlement references when removing members."""
+    is_referenced = (
+        db.query(Expense.id).filter(
+            Expense.ledger_id == ledger_id,
+            (Expense.payer_id == user_id) | (Expense.created_by == user_id),
+        ).first()
+        or db.query(ExpenseSplit.id).join(Expense).filter(
+            Expense.ledger_id == ledger_id,
+            ExpenseSplit.user_id == user_id,
+        ).first()
+        or db.query(Settlement.id).filter(
+            Settlement.ledger_id == ledger_id,
+            (Settlement.from_user_id == user_id) | (Settlement.to_user_id == user_id),
+        ).first()
+    )
 
-    membership = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-        LedgerMember.user_id == user_id
-    ).first()
-
-    if not membership:
-        raise HTTPException(status_code=404, detail="Member not found")
-
-    # Check permission: owner can remove anyone, member can only remove themselves
-    if current_user.id != ledger.owner_id and current_user.id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized to remove this member")
-
-    # Owner cannot remove themselves
-    if ledger.owner_id == user_id:
-        raise HTTPException(status_code=400, detail="Owner cannot be removed")
-
-    db.delete(membership)
-    db.commit()
-    return None
+    if is_referenced:
+        raise HTTPException(
+            status_code=400,
+            detail="Member has expenses or settlements and cannot be removed"
+        )
 
 
 @router.delete("/{ledger_id}/members/me", status_code=status.HTTP_204_NO_CONTENT)
@@ -355,6 +381,42 @@ def leave_ledger(
 
     if not membership:
         raise HTTPException(status_code=404, detail="Not a member of this ledger")
+
+    ensure_member_can_be_removed(db, ledger_id, current_user.id)
+
+    db.delete(membership)
+    db.commit()
+    return None
+
+
+@router.delete("/{ledger_id}/members/{member_identifier}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_member(
+    ledger_id: UUID,
+    member_identifier: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Remove a member by user ID or ledger member record ID."""
+    ledger = get_ledger_or_404(db, ledger_id)
+
+    membership = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == ledger_id,
+        (LedgerMember.user_id == member_identifier) | (LedgerMember.id == member_identifier),
+    ).first()
+
+    if not membership:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    # Check permission: owner can remove anyone, members can only remove themselves.
+    if current_user.id != ledger.owner_id and membership.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to remove this member")
+
+    # Owner cannot remove themselves
+    if membership.user_id == ledger.owner_id:
+        raise HTTPException(status_code=400, detail="Owner cannot be removed")
+
+    if membership.user_id:
+        ensure_member_can_be_removed(db, ledger_id, membership.user_id)
 
     db.delete(membership)
     db.commit()

@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Numeric, Text, DateTime, ForeignKey
+from sqlalchemy import CheckConstraint, Column, String, Numeric, Text, DateTime, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -9,6 +9,10 @@ from app.database import Base
 
 class Settlement(Base):
     __tablename__ = "settlements"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_settlements_amount_positive"),
+        CheckConstraint("from_user_id <> to_user_id", name="ck_settlements_users_different"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     ledger_id = Column(UUID(as_uuid=True), ForeignKey("ledgers.id", ondelete="CASCADE"), nullable=False)
