@@ -1,0 +1,59 @@
+name: Backend Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: backend-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Read version
+        id: ver
+        run: echo "tag=$(cat .version)" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: crpi-3xux8vqn35fw00z9.cn-shanghai.personal.cr.aliyuncs.com
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: Build & push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: crpi-3xux8vqn35fw00z9.cn-shanghai.personal.cr.aliyuncs.com/project_hub/evenly-backend-service:${{ steps.ver.outputs.tag }}
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.DEPLOY_PASSWORD }}
+          script: |
+            set -e
+            IMAGE=crpi-3xux8vqn35fw00z9.cn-shanghai.personal.cr.aliyuncs.com/project_hub/evenly-backend-service:${{ steps.ver.outputs.tag }}
+            docker pull "$IMAGE"
+            docker stop evenly-backend-service || true
+            docker rm evenly-backend-service || true
+            docker run -d --name evenly-backend-service --restart unless-stopped \
+              -p 8000:8000 \
+              -v /opt/evenly-backend-service/config/config.yaml:/app/config/config.yaml:ro \
+              "$IMAGE"
+            sleep 4
+            docker exec evenly-backend-service sh -c 'cd /app && python -m alembic upgrade head'
+            curl -sf -o /dev/null http://127.0.0.1:8000/docs
+            echo "deploy ok"
