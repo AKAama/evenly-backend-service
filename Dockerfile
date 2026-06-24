@@ -17,7 +17,7 @@ WORKDIR /app
 # 先创建用户
 RUN useradd -m appuser
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml ./
 RUN pip install --upgrade pip && pip install .
 
 COPY app/ ./app/
