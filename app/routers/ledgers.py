@@ -366,20 +366,20 @@ def get_members(
     return result
 
 
-def ensure_member_can_be_removed(db: Session, ledger_id: UUID, user_id: UUID):
+def ensure_member_can_be_removed(db: Session, ledger_id: UUID, membership: LedgerMember):
     """Preserve historical expense and settlement references when removing members."""
     is_referenced = (
         db.query(Expense.id).filter(
             Expense.ledger_id == ledger_id,
-            (Expense.payer_id == user_id) | (Expense.created_by == user_id),
+            (Expense.payer_id == membership.user_id) | (Expense.created_by == membership.user_id),
         ).first()
         or db.query(ExpenseSplit.id).join(Expense).filter(
             Expense.ledger_id == ledger_id,
-            ExpenseSplit.user_id == user_id,
+            ExpenseSplit.member_id == membership.id,
         ).first()
         or db.query(Settlement.id).filter(
             Settlement.ledger_id == ledger_id,
-            (Settlement.from_user_id == user_id) | (Settlement.to_user_id == user_id),
+            (Settlement.from_user_id == membership.user_id) | (Settlement.to_user_id == membership.user_id),
         ).first()
     )
 
@@ -410,7 +410,7 @@ def leave_ledger(
     if not membership:
         raise HTTPException(status_code=404, detail="Not a member of this ledger")
 
-    ensure_member_can_be_removed(db, ledger_id, current_user.id)
+    ensure_member_can_be_removed(db, ledger_id, membership)
 
     db.delete(membership)
     db.commit()
@@ -443,8 +443,7 @@ def remove_member(
     if membership.user_id == ledger.owner_id:
         raise HTTPException(status_code=400, detail="Owner cannot be removed")
 
-    if membership.user_id:
-        ensure_member_can_be_removed(db, ledger_id, membership.user_id)
+    ensure_member_can_be_removed(db, ledger_id, membership)
 
     db.delete(membership)
     db.commit()

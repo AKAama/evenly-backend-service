@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base
 from app.database import get_db
-from app.models import ExpenseStatus, Ledger, LedgerMember, User
+from app.models import ExpenseSplit, ExpenseStatus, Ledger, LedgerMember, User
 from app.routers.expenses import confirm_expense, create_expense
 from app.routers.ledgers import create_ledger, get_ledger, get_ledgers, remove_member
 from app.routers import users as users_router
@@ -206,6 +206,43 @@ def test_create_expense_rejects_split_for_non_member(db):
         create_expense(ledger.id, payload, db=db, current_user=owner)
 
     assert_http_error(exc_info, 400)
+
+
+def test_expense_split_schema_accepts_ledger_member_id():
+    assert "member_id" in ExpenseSplitCreate.model_fields
+
+
+def test_create_expense_allows_temporary_member_split(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    ledger = make_ledger(db, owner, with_temp_member=True)
+    owner_member = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == ledger.id,
+        LedgerMember.user_id == owner.id,
+    ).one()
+    temporary_member = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == ledger.id,
+        LedgerMember.is_temporary.is_(True),
+    ).one()
+
+    created = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Lunch",
+            total_amount=Decimal("12.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(member_id=owner_member.id, amount=Decimal("6.00")),
+                ExpenseSplitCreate(member_id=temporary_member.id, amount=Decimal("6.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+
+    splits = db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == created.id).all()
+    assert {split.member_id for split in splits} == {owner_member.id, temporary_member.id}
+    assert next(split for split in splits if split.member_id == temporary_member.id).user_id is None
 
 
 def test_create_expense_rejects_non_positive_split_amount(db):

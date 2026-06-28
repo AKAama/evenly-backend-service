@@ -7,12 +7,12 @@ from app.schemas.user import UserResponse
 
 
 class ExpenseSplitBase(BaseModel):
-    user_id: UUID
     amount: Decimal
 
 
 class ExpenseSplitCreate(ExpenseSplitBase):
-    pass
+    user_id: UUID | None = None
+    member_id: UUID | None = None
 
 
 class ExpenseSplitResponse(ExpenseSplitBase):
@@ -20,6 +20,8 @@ class ExpenseSplitResponse(ExpenseSplitBase):
 
     id: UUID
     expense_id: UUID
+    user_id: UUID | None = None
+    member_id: UUID | None = None
     created_at: datetime
 
 

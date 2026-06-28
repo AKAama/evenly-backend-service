@@ -44,25 +44,33 @@ def create_expense(
     if not expense.splits:
         raise HTTPException(status_code=400, detail="At least one split is required")
 
-    member_ids = {
-        m.user_id
-        for m in db.query(LedgerMember).filter(LedgerMember.ledger_id == ledger_id).all()
-        if m.user_id is not None and not m.is_temporary
+    members = db.query(LedgerMember).filter(LedgerMember.ledger_id == ledger_id).all()
+    members_by_id = {member.id: member for member in members}
+    members_by_user_id = {
+        member.user_id: member for member in members if member.user_id is not None
     }
 
-    split_user_ids = [s.user_id for s in expense.splits]
-    if len(split_user_ids) != len(set(split_user_ids)):
-        raise HTTPException(status_code=400, detail="Duplicate users in splits are not allowed")
+    resolved_splits = []
+    for split in expense.splits:
+        member = members_by_id.get(split.member_id) if split.member_id else None
+        if member is None and split.user_id:
+            member = members_by_user_id.get(split.user_id)
+        if member is None:
+            raise HTTPException(status_code=400, detail="All split members must belong to the ledger")
+        if split.user_id and member.user_id != split.user_id:
+            raise HTTPException(status_code=400, detail="Split user and member do not match")
+        resolved_splits.append((split, member))
+
+    split_member_ids = [member.id for _, member in resolved_splits]
+    if len(split_member_ids) != len(set(split_member_ids)):
+        raise HTTPException(status_code=400, detail="Duplicate members in splits are not allowed")
 
     if any(split.amount <= 0 for split in expense.splits):
         raise HTTPException(status_code=400, detail="Split amounts must be greater than zero")
 
-    if expense.payer_id not in member_ids:
+    payer_member = members_by_user_id.get(expense.payer_id)
+    if payer_member is None or payer_member.is_temporary:
         raise HTTPException(status_code=400, detail="Payer must be a registered ledger member")
-
-    invalid_split_ids = set(split_user_ids) - member_ids
-    if invalid_split_ids:
-        raise HTTPException(status_code=400, detail="All split users must be registered ledger members")
 
     # Validate splits total equals expense total
     split_total = normalize_money(sum(s.amount for s in expense.splits))
@@ -74,7 +82,7 @@ def create_expense(
         )
 
     # Validate payer is in splits
-    payer_in_splits = any(s.user_id == expense.payer_id for s in expense.splits)
+    payer_in_splits = any(member.id == payer_member.id for _, member in resolved_splits)
     if not payer_in_splits:
         raise HTTPException(status_code=400, detail="Payer must be included in splits")
 
@@ -94,10 +102,11 @@ def create_expense(
     db.refresh(db_expense)
 
     # Create splits
-    for split in expense.splits:
+    for split, member in resolved_splits:
         db_split = ExpenseSplit(
             expense_id=db_expense.id,
-            user_id=split.user_id,
+            user_id=member.user_id,
+            member_id=member.id,
             amount=split.amount,
         )
         db.add(db_split)
@@ -144,6 +153,7 @@ def get_expenses(
                     id=s.id,
                     expense_id=s.expense_id,
                     user_id=s.user_id,
+                    member_id=s.member_id,
                     amount=s.amount,
                     created_at=s.created_at
                 )
@@ -183,6 +193,7 @@ def confirm_expense(
     split_participants = {
         s.user_id
         for s in db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == expense_id).all()
+        if s.user_id is not None
     }
     if current_user.id not in split_participants:
         raise HTTPException(status_code=403, detail="Only expense participants can confirm this expense")
@@ -302,6 +313,7 @@ def get_expense(
                 id=s.id,
                 expense_id=s.expense_id,
                 user_id=s.user_id,
+                member_id=s.member_id,
                 amount=s.amount,
                 created_at=s.created_at
             )
