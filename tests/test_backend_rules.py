@@ -1,9 +1,11 @@
 import uuid
+from io import BytesIO
 from datetime import date
 from decimal import Decimal
 
 import pytest
 from fastapi import HTTPException
+from starlette.datastructures import Headers, UploadFile
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -14,6 +16,7 @@ from app.database import get_db
 from app.models import ExpenseStatus, Ledger, LedgerMember, User
 from app.routers.expenses import confirm_expense, create_expense
 from app.routers.ledgers import create_ledger, get_ledger, get_ledgers, remove_member
+from app.routers import users as users_router
 from app.schemas.ledger import LedgerCreate
 from app.routers.settlements import create_settlement, get_settlements
 from app.schemas.expense import ConfirmExpenseRequest, ExpenseCreate, ExpenseSplitCreate
@@ -158,6 +161,29 @@ def test_ledger_summary_counts_members_and_expenses(db):
     assert len(result) == 1
     assert result[0].member_count == 3
     assert result[0].expense_count == 1
+
+
+@pytest.mark.asyncio
+async def test_avatar_storage_failure_returns_bad_gateway(db, monkeypatch):
+    user = make_user(db, "owner@example.com", "Owner")
+
+    class FailingStorage:
+        def upload_file(self, **_kwargs):
+            raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr(users_router.settings, "cos", object())
+    monkeypatch.setattr(users_router, "get_cos_service", lambda: FailingStorage())
+    upload = UploadFile(
+        file=BytesIO(b"fake-jpeg"),
+        filename="avatar.jpg",
+        headers=Headers({"content-type": "image/jpeg"}),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await users_router.upload_avatar(file=upload, current_user=user, db=db)
+
+    assert_http_error(exc_info, 502)
+    assert exc_info.value.detail == "Avatar storage is temporarily unavailable"
 
 
 def test_create_expense_rejects_split_for_non_member(db):

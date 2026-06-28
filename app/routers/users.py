@@ -1,4 +1,5 @@
 from uuid import UUID
+import logging
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from sqlalchemy.orm import Session
 from typing import List
@@ -12,6 +13,7 @@ from app.services.auth import verify_password, get_password_hash
 from app.config import settings
 
 router = APIRouter(prefix="/users", tags=["users"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("/me", response_model=UserResponse)
@@ -44,6 +46,13 @@ async def upload_avatar(
 
     # Validate file size (max 5MB)
     contents = await file.read()
+    logger.info(
+        "Avatar upload received user_id=%s filename=%s content_type=%s size=%d",
+        current_user.id,
+        file.filename,
+        file.content_type,
+        len(contents),
+    )
     if len(contents) > 5 * 1024 * 1024:
         raise HTTPException(
             status_code=400,
@@ -51,12 +60,21 @@ async def upload_avatar(
         )
 
     # Upload to COS
-    cos_service = get_cos_service()
-    avatar_url = cos_service.upload_file(
-        file_data=contents,
-        filename=file.filename,
-        folder="avatars"
-    )
+    try:
+        cos_service = get_cos_service()
+        if cos_service is None:
+            raise RuntimeError("COS service unavailable")
+        avatar_url = cos_service.upload_file(
+            file_data=contents,
+            filename=file.filename,
+            folder="avatars"
+        )
+    except Exception as exc:
+        logger.exception("Avatar storage failed user_id=%s: %s", current_user.id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Avatar storage is temporarily unavailable",
+        ) from exc
 
     # Delete old avatar if exists (optional: implement cleanup)
     # if current_user.avatar_url:
@@ -66,6 +84,8 @@ async def upload_avatar(
     current_user.avatar_url = avatar_url
     db.commit()
     db.refresh(current_user)
+
+    logger.info("Avatar updated user_id=%s", current_user.id)
 
     return current_user
 
