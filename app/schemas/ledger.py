@@ -44,6 +44,8 @@ class LedgerResponse(LedgerBase):
     owner_id: UUID
     created_at: datetime
     updated_at: datetime
+    member_count: int = 0
+    expense_count: int = 0
 
 
 class LedgerWithMembers(LedgerResponse):

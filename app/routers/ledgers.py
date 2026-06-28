@@ -1,6 +1,7 @@
 import logging
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -145,8 +146,35 @@ def get_ledgers(
     member_query = db.query(LedgerMember).filter(LedgerMember.user_id == current_user.id)
     member_ledger_ids = [m.ledger_id for m in member_query.all()]
 
-    ledgers = db.query(Ledger).filter(Ledger.id.in_(member_ledger_ids)).all()
-    return ledgers
+    member_count = (
+        db.query(func.count(LedgerMember.id))
+        .filter(LedgerMember.ledger_id == Ledger.id)
+        .correlate(Ledger)
+        .scalar_subquery()
+    )
+    expense_count = (
+        db.query(func.count(Expense.id))
+        .filter(Expense.ledger_id == Ledger.id)
+        .correlate(Ledger)
+        .scalar_subquery()
+    )
+    rows = (
+        db.query(
+            Ledger,
+            member_count.label("member_count"),
+            expense_count.label("expense_count"),
+        )
+        .filter(Ledger.id.in_(member_ledger_ids))
+        .all()
+    )
+
+    return [
+        LedgerResponse.model_validate(ledger).model_copy(update={
+            "member_count": row_member_count,
+            "expense_count": row_expense_count,
+        })
+        for ledger, row_member_count, row_expense_count in rows
+    ]
 
 
 @router.get("/{ledger_id}", response_model=LedgerWithMembers)

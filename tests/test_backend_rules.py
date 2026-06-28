@@ -13,7 +13,7 @@ from app.database import Base
 from app.database import get_db
 from app.models import ExpenseStatus, Ledger, LedgerMember, User
 from app.routers.expenses import confirm_expense, create_expense
-from app.routers.ledgers import create_ledger, get_ledger, remove_member
+from app.routers.ledgers import create_ledger, get_ledger, get_ledgers, remove_member
 from app.schemas.ledger import LedgerCreate
 from app.routers.settlements import create_settlement, get_settlements
 from app.schemas.expense import ConfirmExpenseRequest, ExpenseCreate, ExpenseSplitCreate
@@ -129,6 +129,35 @@ def test_create_ledger_response_includes_owner_member_id(db):
     assert len(response.members) == 1
     assert response.members[0].id is not None
     assert response.members[0].user_id == owner.id
+
+
+def test_ledger_summary_counts_members_and_expenses(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner, with_temp_member=True)
+    add_member(db, ledger, friend)
+
+    create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Lunch",
+            total_amount=Decimal("12.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("6.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("6.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+
+    result = get_ledgers(db=db, current_user=owner)
+
+    assert len(result) == 1
+    assert result[0].member_count == 3
+    assert result[0].expense_count == 1
 
 
 def test_create_expense_rejects_split_for_non_member(db):
