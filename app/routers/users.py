@@ -5,7 +5,15 @@ from sqlalchemy.orm import Session
 from typing import List
 
 from app.database import get_db
-from app.models import User
+from app.models import (
+    User,
+    Ledger,
+    LedgerMember,
+    Expense,
+    ExpenseSplit,
+    ExpenseConfirmation,
+    Settlement,
+)
 from app.schemas.user import UserResponse, UserUpdate, PasswordChange
 from app.utils.deps import get_current_user
 from app.services.cos import get_cos_service
@@ -143,3 +151,64 @@ def change_password(
     db.commit()
 
     return {"message": "Password updated successfully"}
+
+
+@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
+def delete_account(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Permanently delete the current account and its associated data."""
+    user_id = current_user.id
+    avatar_url = current_user.avatar_url
+
+    # Delete ledgers owned by the user in full.
+    for ledger in db.query(Ledger).filter(Ledger.owner_id == user_id).all():
+        db.delete(ledger)
+    db.flush()
+
+    # Remove user-generated records from shared ledgers. These records retain
+    # direct references to the account and must not survive account deletion.
+    split_expense_ids = {
+        expense_id
+        for (expense_id,) in db.query(ExpenseSplit.expense_id).filter(
+            ExpenseSplit.user_id == user_id
+        ).all()
+    }
+    related_expenses = db.query(Expense).filter(
+        (Expense.payer_id == user_id)
+        | (Expense.created_by == user_id)
+        | (Expense.id.in_(split_expense_ids) if split_expense_ids else False)
+    ).all()
+    for expense in related_expenses:
+        db.delete(expense)
+    db.flush()
+
+    db.query(Settlement).filter(
+        (Settlement.from_user_id == user_id) | (Settlement.to_user_id == user_id)
+    ).delete(synchronize_session=False)
+    db.query(ExpenseConfirmation).filter(
+        ExpenseConfirmation.user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(ExpenseSplit).filter(
+        ExpenseSplit.user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(LedgerMember).filter(
+        LedgerMember.user_id == user_id
+    ).delete(synchronize_session=False)
+
+    db.delete(current_user)
+    db.commit()
+
+    if avatar_url and settings.cos:
+        try:
+            cos_service = get_cos_service()
+            if cos_service is not None:
+                cos_service.delete_file(avatar_url)
+        except Exception:
+            # Do not restore a deleted account because external object cleanup
+            # failed. The orphan can be cleaned up from logs later.
+            logger.exception("Avatar cleanup failed for deleted user_id=%s", user_id)
+
+    logger.info("Account permanently deleted user_id=%s", user_id)
+    return None

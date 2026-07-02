@@ -13,7 +13,16 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base
 from app.database import get_db
-from app.models import ExpenseSplit, ExpenseStatus, Ledger, LedgerMember, User
+from app.models import (
+    Expense,
+    ExpenseConfirmation,
+    ExpenseSplit,
+    ExpenseStatus,
+    Ledger,
+    LedgerMember,
+    Settlement,
+    User,
+)
 from app.routers.expenses import confirm_expense, create_expense
 from app.routers.ledgers import create_ledger, get_ledger, get_ledgers, remove_member
 from app.routers import users as users_router
@@ -186,6 +195,66 @@ async def test_avatar_storage_failure_returns_bad_gateway(db, monkeypatch):
     assert exc_info.value.detail == "Avatar storage is temporarily unavailable"
 
 
+def test_delete_account_removes_owned_and_shared_user_data(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    deleting_user = make_user(db, "delete@example.com", "Delete Me")
+    owned_ledger = make_ledger(db, deleting_user)
+    shared_ledger = make_ledger(db, owner)
+    add_member(db, shared_ledger, deleting_user)
+
+    expense = Expense(
+        ledger_id=shared_ledger.id,
+        payer_id=deleting_user.id,
+        created_by=deleting_user.id,
+        title="Shared lunch",
+        total_amount=Decimal("20.00"),
+        expense_date=date.today(),
+        status=ExpenseStatus.PENDING,
+    )
+    db.add(expense)
+    db.flush()
+    membership = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == shared_ledger.id,
+        LedgerMember.user_id == deleting_user.id,
+    ).one()
+    db.add(ExpenseSplit(
+        expense_id=expense.id,
+        user_id=deleting_user.id,
+        member_id=membership.id,
+        amount=Decimal("20.00"),
+    ))
+    db.add(ExpenseConfirmation(
+        expense_id=expense.id,
+        user_id=deleting_user.id,
+        status="confirmed",
+    ))
+    db.add(Settlement(
+        ledger_id=shared_ledger.id,
+        from_user_id=deleting_user.id,
+        to_user_id=owner.id,
+        amount=Decimal("5.00"),
+    ))
+    db.commit()
+
+    users_router.delete_account(current_user=deleting_user, db=db)
+
+    assert db.query(User).filter(User.id == deleting_user.id).first() is None
+    assert db.query(Ledger).filter(Ledger.id == owned_ledger.id).first() is None
+    assert db.query(Ledger).filter(Ledger.id == shared_ledger.id).first() is not None
+    assert db.query(LedgerMember).filter(LedgerMember.user_id == deleting_user.id).count() == 0
+    assert db.query(Expense).filter(Expense.id == expense.id).first() is None
+    assert db.query(Settlement).filter(
+        (Settlement.from_user_id == deleting_user.id)
+        | (Settlement.to_user_id == deleting_user.id)
+    ).count() == 0
+
+
+def test_delete_account_endpoint_requires_authentication(client):
+    response = client.delete("/users/me")
+
+    assert response.status_code == 401
+
+
 def test_create_expense_rejects_split_for_non_member(db):
     owner = make_user(db, "owner@example.com", "Owner")
     intruder = make_user(db, "intruder@example.com", "Intruder")
@@ -243,6 +312,37 @@ def test_create_expense_allows_temporary_member_split(db):
     splits = db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == created.id).all()
     assert {split.member_id for split in splits} == {owner_member.id, temporary_member.id}
     assert next(split for split in splits if split.member_id == temporary_member.id).user_id is None
+
+
+def test_create_expense_resolves_member_id_from_registered_user_id(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+    members = db.query(LedgerMember).filter(LedgerMember.ledger_id == ledger.id).all()
+    member_by_user = {member.user_id: member for member in members}
+
+    created = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Dinner",
+            total_amount=Decimal("500.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("250.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("250.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+
+    splits = db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == created.id).all()
+    assert {split.member_id for split in splits} == {
+        member_by_user[owner.id].id,
+        member_by_user[friend.id].id,
+    }
 
 
 def test_create_expense_rejects_non_positive_split_amount(db):

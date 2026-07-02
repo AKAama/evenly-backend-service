@@ -98,8 +98,9 @@ def create_expense(
         status=ExpenseStatus.PENDING,
     )
     db.add(db_expense)
-    db.commit()
-    db.refresh(db_expense)
+    # Keep the expense and all split rows in one transaction. If any split
+    # violates a constraint, no orphan expense is left behind.
+    db.flush()
 
     # Create splits
     for split, member in resolved_splits:
