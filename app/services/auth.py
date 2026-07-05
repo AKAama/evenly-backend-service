@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from uuid import UUID
 from jose import JWTError, jwt
 import bcrypt
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -49,6 +50,10 @@ def get_user_by_email(db: Session, email: str) -> User | None:
     return db.query(User).filter(User.email == email).first()
 
 
+def get_user_by_username(db: Session, username: str) -> User | None:
+    return db.query(User).filter(func.lower(User.username) == username.lower()).first()
+
+
 def get_user_by_id(db: Session, user_id: UUID) -> User | None:
     return db.query(User).filter(User.id == user_id).first()
 
@@ -57,6 +62,7 @@ def create_user(db: Session, user: UserCreate) -> User:
     hashed_password = get_password_hash(user.password)
     db_user = User(
         email=user.email,
+        username=user.username,
         password_hash=hashed_password,
         display_name=user.display_name,
         avatar_url=user.avatar_url,
@@ -68,7 +74,11 @@ def create_user(db: Session, user: UserCreate) -> User:
 
 
 def authenticate_user(db: Session, user_login: UserLogin) -> User | None:
-    user = get_user_by_email(db, user_login.email)
+    identifier = user_login.identifier.strip()
+    user = db.query(User).filter(or_(
+        func.lower(User.email) == identifier.lower(),
+        func.lower(User.username) == identifier.lower(),
+    )).first()
     if not user:
         return None
     if not verify_password(user_login.password, user.password_hash):

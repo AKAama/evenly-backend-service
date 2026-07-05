@@ -6,6 +6,7 @@ from pydantic import BaseModel, EmailStr, ConfigDict
 # User schemas
 class UserBase(BaseModel):
     email: EmailStr
+    username: str
     display_name: str | None = None
     avatar_url: str | None = None
 
@@ -15,7 +16,7 @@ class UserCreate(UserBase):
 
 
 class UserLogin(BaseModel):
-    email: EmailStr
+    identifier: str
     password: str
 
 

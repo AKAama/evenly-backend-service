@@ -56,6 +56,7 @@ def make_user(db, email, display_name):
     user = User(
         id=uuid.uuid4(),
         email=email,
+        username=email.split("@", 1)[0],
         display_name=display_name,
         password_hash="hashed",
     )
@@ -69,6 +70,7 @@ def make_login_user(db, email, display_name, password="secret123"):
     user = User(
         id=uuid.uuid4(),
         email=email,
+        username=email.split("@", 1)[0],
         display_name=display_name,
         password_hash=get_password_hash(password),
     )
@@ -598,3 +600,14 @@ def test_web_login_sets_http_only_cookie_and_logout_clears_it(db, client):
     assert logout_response.status_code == 200
     assert "evenly_access_token=" in logout_response.headers["set-cookie"]
     assert "Max-Age=0" in logout_response.headers["set-cookie"]
+
+
+def test_login_accepts_case_insensitive_username(db, client):
+    make_login_user(db, "owner@example.com", "Owner")
+
+    response = client.post(
+        "/auth/login",
+        data={"username": "OWNER", "password": "secret123"},
+    )
+
+    assert response.status_code == 200

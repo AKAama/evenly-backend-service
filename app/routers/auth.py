@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException, Response, status, UploadFile, File, Form
 from fastapi.security import OAuth2PasswordRequestForm
@@ -8,7 +9,7 @@ from pydantic import BaseModel, EmailStr
 
 from app.database import get_db
 from app.schemas.user import UserCreate, UserResponse, Token
-from app.services.auth import create_user, authenticate_user, create_access_token, get_user_by_email
+from app.services.auth import create_user, authenticate_user, create_access_token, get_user_by_email, get_user_by_username
 from app.services.cos import get_cos_service
 from app.services.verification import send_verification_code, verify_code
 from app.config import settings
@@ -91,6 +92,7 @@ async def register(
     email: Annotated[str, Form()],
     password: Annotated[str, Form()],
     code: Annotated[str, Form()],
+    username: Annotated[str, Form()],
     display_name: Annotated[str | None, Form()] = None,
     avatar: Annotated[UploadFile | None, File()] = None,
     db: Session = Depends(get_db)
@@ -109,6 +111,12 @@ async def register(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered"
         )
+
+    username = username.strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{2,29}", username):
+        raise HTTPException(status_code=400, detail="用户名须为3-30位，以英文字母开头，仅包含英文、数字和下划线")
+    if get_user_by_username(db, username):
+        raise HTTPException(status_code=400, detail="用户名已被使用")
 
     # Handle avatar upload
     avatar_url = None
@@ -159,6 +167,7 @@ async def register(
     # Create user
     user_data = UserCreate(
         email=email,
+        username=username,
         password=password,
         display_name=display_name,
         avatar_url=avatar_url
@@ -188,7 +197,7 @@ def login(
     db: Session = Depends(get_db)
 ):
     # Use form_data.username as email
-    user = authenticate_user(db, type("UserLogin", (), {"email": form_data.username, "password": form_data.password})())
+    user = authenticate_user(db, type("UserLogin", (), {"identifier": form_data.username, "password": form_data.password})())
 
     if not user:
         raise HTTPException(

@@ -106,9 +106,11 @@ def search_users(
     current_user: User = Depends(get_current_user)
 ):
     """Search users by email or display name"""
-    # Search by email or display_name (case insensitive)
+    # Search by email, username, or display_name (case insensitive)
     query = db.query(User).filter(
-        (User.email.ilike(f"%{q}%")) | (User.display_name.ilike(f"%{q}%"))
+        (User.email.ilike(f"%{q}%")) |
+        (User.username.ilike(f"%{q}%")) |
+        (User.display_name.ilike(f"%{q}%"))
     ).limit(limit).all()
 
     # Exclude current user from results
