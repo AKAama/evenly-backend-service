@@ -15,6 +15,7 @@ from app.schemas.ledger import (
     MemberResponse,
     MemberCreate,
     LedgerInvitationResponse,
+    LedgerMemberWithUser,
 )
 from app.schemas.user import UserResponse
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
@@ -257,22 +258,22 @@ def get_ledger(
     ledger = get_ledger_or_404(db, ledger_id)
     require_ledger_member(db, ledger_id, current_user)
 
-    # Get members with user details
+    # Get members with user details (include pending so owner can see outstanding invitations)
     members = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger_id,
-        LedgerMember.status == "active",
     ).all()
-    member_responses = []
+    member_responses: list[LedgerMemberWithUser] = []
     for m in members:
         user = db.query(User).filter(User.id == m.user_id).first() if m.user_id and not m.is_temporary else None
-        member_responses.append(MemberResponse(
+        member_responses.append(LedgerMemberWithUser(
             id=m.id,
             user_id=m.user_id,
             nickname=m.nickname,
             joined_at=m.joined_at,
             user=UserResponse.model_validate(user) if user else None,
             is_temporary=m.is_temporary,
-            temporary_name=m.temporary_name
+            temporary_name=m.temporary_name,
+            status=m.status,
         ))
 
     response = LedgerWithMembers.model_validate(ledger)
@@ -423,12 +424,11 @@ def get_members(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Get all members of a ledger"""
+    """Get all members of a ledger (including pending invitations so members can see who hasn't joined yet)"""
     require_ledger_member(db, ledger_id, current_user)
 
     members = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger_id,
-        LedgerMember.status == "active",
     ).all()
     result = []
     for m in members:
@@ -440,7 +440,8 @@ def get_members(
             joined_at=m.joined_at,
             user=UserResponse.model_validate(user) if user else None,
             is_temporary=m.is_temporary,
-            temporary_name=m.temporary_name
+            temporary_name=m.temporary_name,
+            status=m.status,
         ))
     return result
 

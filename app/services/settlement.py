@@ -25,17 +25,24 @@ class SettlementCalculator:
         )
 
     def get_ledger_members(self) -> list[LedgerMember]:
-        """Get all members of the ledger"""
+        """Get active members of the ledger (pending invitations don't participate in balances)"""
         return (
             self.db.query(LedgerMember)
-            .filter(LedgerMember.ledger_id == self.ledger_id)
+            .filter(
+                LedgerMember.ledger_id == self.ledger_id,
+                LedgerMember.status == "active",
+            )
             .all()
         )
 
     def calculate_net_balances(self) -> dict[UUID, Decimal]:
         """
         Calculate net balance for each user.
-        net = paid_amount - owed_amount
+        net = paid_amount - owed_amount - settled_paid + settled_received
+
+        A recorded settlement A->B of amount X means A has paid X to B,
+        which should reduce A's debt by X (A's net += X) and reduce B's
+        receivable by X (B's net -= X).
 
         Positive net: user should receive money
         Negative net: user owes money
@@ -73,12 +80,37 @@ class SettlementCalculator:
 
         paid_dict: dict[UUID, Decimal] = {uid: Decimal(str(amount or 0)) for uid, amount in paid_amounts}
 
-        # Step 3: Calculate net balances
+        # Step 3: Apply already-recorded settlement payments.
+        # A->B amount X: A paid X to already settle part of the debt, so
+        #   A's net balance increases by X (owes X less)
+        #   B's net balance decreases by X (receives X less)
+        settlement_paid: dict[UUID, Decimal] = {uid: Decimal("0") for uid in member_ids}
+        settlements = (
+            self.db.query(Settlement.from_user_id, Settlement.to_user_id, func.sum(Settlement.amount))
+            .filter(Settlement.ledger_id == self.ledger_id)
+            .group_by(Settlement.from_user_id, Settlement.to_user_id)
+            .all()
+        )
+        for from_uid, to_uid, amount in settlements:
+            amt = Decimal(str(amount or 0))
+            if from_uid in settlement_paid:
+                settlement_paid[from_uid] += amt
+            if to_uid in settlement_paid:
+                settlement_paid[to_uid] -= amt
+
+        # Step 4: Calculate net balances (receives positive = credits, gives negative = debts)
         net_balances: dict[UUID, Decimal] = {}
         for member in members:
-            owed = owed_dict.get(member.user_id, Decimal("0"))
-            paid = paid_dict.get(member.user_id, Decimal("0"))
-            net_balances[member.user_id] = paid - owed
+            uid = member.user_id
+            owed = owed_dict.get(uid, Decimal("0"))
+            paid = paid_dict.get(uid, Decimal("0"))
+            settled = settlement_paid.get(uid, Decimal("0"))
+            net_balances[uid] = paid - owed + settled
+
+        # Round away tiny floating-point noise
+        for uid in list(net_balances.keys()):
+            if abs(net_balances[uid]) < Decimal("0.01"):
+                net_balances[uid] = Decimal("0")
 
         return net_balances
 

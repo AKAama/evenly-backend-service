@@ -14,6 +14,7 @@ class LedgerMemberResponse(BaseModel):
     joined_at: datetime
     is_temporary: bool = False
     temporary_name: str | None = None
+    status: str = "active"
 
 
 class LedgerMemberWithUser(LedgerMemberResponse):

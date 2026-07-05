@@ -449,7 +449,8 @@ def test_settlement_rejects_same_user_and_non_positive_amount(db):
     assert_http_error(exc_info, 400)
 
 
-def test_recorded_settlement_does_not_change_complete_settlement_plan(db):
+def test_recorded_settlement_reduces_remaining_settlement_amount(db):
+    """Recording a partial settlement reduces the remaining suggested amount."""
     owner = make_user(db, "owner@example.com", "Owner")
     friend = make_user(db, "friend@example.com", "Friend")
     ledger = make_ledger(db, owner)
@@ -466,14 +467,15 @@ def test_recorded_settlement_does_not_change_complete_settlement_plan(db):
         ],
     )
     expense = create_expense(ledger.id, payload, db=db, current_user=owner)
-    assert expense.status == ExpenseStatus.PENDING
     confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=friend)
 
     suggestions = get_settlements(ledger.id, db=db, current_user=owner)
+    assert len(suggestions) == 1
     assert suggestions[0].from_user_id == friend.id
     assert suggestions[0].to_user_id == owner.id
     assert suggestions[0].amount == Decimal("5.00")
 
+    # Partial payment of 2 -> remaining should be 3
     create_settlement(
         ledger.id,
         SettlementCreate(
@@ -486,7 +488,81 @@ def test_recorded_settlement_does_not_change_complete_settlement_plan(db):
     )
 
     suggestions = get_settlements(ledger.id, db=db, current_user=owner)
-    assert suggestions[0].amount == Decimal("5.00")
+    assert len(suggestions) == 1
+    assert suggestions[0].from_user_id == friend.id
+    assert suggestions[0].to_user_id == owner.id
+    assert suggestions[0].amount == Decimal("3.00")
+
+
+def test_full_settlement_clears_suggestions_and_new_expense_only_counts_new_debt(db):
+    """After a bill is fully settled, a new expense must not double-count the old one.
+
+    Scenario (the reported bug):
+      1. A pays 100 for dinner, B owes A 50.
+      2. B pays A 50 via settlement; the ledger is balanced.
+      3. A pays another 60 for lunch, B owes A 30.
+      4. The suggestion should be B->A 30, NOT B->A 80.
+    """
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+
+    # First expense: owner paid 100, split 50/50
+    dinner = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Dinner",
+            total_amount=Decimal("100.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("50.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("50.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+    confirm_expense(dinner.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=friend)
+
+    assert get_settlements(ledger.id, db=db, current_user=owner)[0].amount == Decimal("50.00")
+
+    # Friend pays in full
+    create_settlement(
+        ledger.id,
+        SettlementCreate(from_user_id=friend.id, to_user_id=owner.id, amount=Decimal("50.00")),
+        db=db,
+        current_user=owner,
+    )
+
+    # Everything should be settled now
+    assert get_settlements(ledger.id, db=db, current_user=owner) == []
+
+    # Second expense: owner pays 60, split 30/30
+    lunch = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Lunch",
+            total_amount=Decimal("60.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("30.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("30.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+    confirm_expense(lunch.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=friend)
+
+    suggestions = get_settlements(ledger.id, db=db, current_user=owner)
+    assert len(suggestions) == 1
+    assert suggestions[0].from_user_id == friend.id
+    assert suggestions[0].to_user_id == owner.id
+    # Bug would have produced 50 + 30 = 80; correct answer is 30
+    assert suggestions[0].amount == Decimal("30.00")
 
 
 def test_cannot_remove_member_with_expense_history(db):
@@ -623,3 +699,74 @@ def test_login_accepts_case_insensitive_username(db, client):
     )
 
     assert response.status_code == 200
+
+
+def test_get_ledger_returns_pending_members_with_status(db):
+    """GET /ledgers/{id} should include pending members with status='pending' so owners can see outstanding invites."""
+    from app.routers.ledgers import get_ledger
+
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    # Simulate an invited-but-not-yet-accepted member
+    db.add(LedgerMember(
+        ledger_id=ledger.id, user_id=friend.id, nickname=friend.display_name,
+        status="pending", invited_by=owner.id,
+    ))
+    db.commit()
+
+    detail = get_ledger(ledger.id, db=db, current_user=owner)
+    statuses = {m.user_id: m.status for m in detail.members}
+    assert statuses[owner.id] == "active"
+    assert statuses[friend.id] == "pending"
+
+    # The pending friend themselves should NOT be able to access the ledger
+    # (require_ledger_member enforces active)
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        get_ledger(ledger.id, db=db, current_user=friend)
+    assert exc_info.value.status_code == 403
+
+
+def test_settlement_excludes_pending_members(db):
+    """Pending invitations must not participate in settlement calculations."""
+    from app.routers.expenses import create_expense
+    from app.routers.settlements import get_settlements
+    from app.schemas.expense import ExpenseCreate, ExpenseSplitCreate
+    from datetime import date
+
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    outsider = make_user(db, "outsider@example.com", "Outsider")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)  # active (via helper which inserts active)
+    # outsider is invited but hasn't accepted
+    db.add(LedgerMember(
+        ledger_id=ledger.id, user_id=outsider.id, nickname=outsider.display_name,
+        status="pending", invited_by=owner.id,
+    ))
+    db.commit()
+
+    # Owner pays 60, split owner/friend 30/30. Outsider is pending, should NOT be part of anything.
+    create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Lunch",
+            total_amount=Decimal("60.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("30.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("30.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+
+    suggestions = get_settlements(ledger.id, db=db, current_user=owner)
+    # Only friend -> owner 30 should appear; outsider must not show up
+    assert len(suggestions) == 1
+    assert suggestions[0].from_user_id == friend.id
+    assert suggestions[0].to_user_id == owner.id
+    assert suggestions[0].amount == Decimal("30.00")
