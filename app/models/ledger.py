@@ -40,7 +40,9 @@ class LedgerMember(Base):
     # Temporary member support
     is_temporary = Column(Boolean, default=False)
     temporary_name = Column(String(100), nullable=True)
+    status = Column(String(20), nullable=False, default="active")
+    invited_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
     # Relationships
     ledger = relationship("Ledger", back_populates="members")
-    user = relationship("User", back_populates="memberships")
+    user = relationship("User", back_populates="memberships", foreign_keys=[user_id])

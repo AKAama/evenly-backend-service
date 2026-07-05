@@ -20,7 +20,12 @@ class User(Base):
 
     # Relationships
     ledgers = relationship("Ledger", back_populates="owner", cascade="all, delete-orphan")
-    memberships = relationship("LedgerMember", back_populates="user", cascade="all, delete-orphan")
+    memberships = relationship(
+        "LedgerMember",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="LedgerMember.user_id",
+    )
     expenses_created = relationship("Expense", back_populates="creator", foreign_keys="Expense.created_by")
     expenses_paid = relationship("Expense", back_populates="payer", foreign_keys="Expense.payer_id")
     settlements_from = relationship("Settlement", back_populates="from_user", foreign_keys="Settlement.from_user_id")

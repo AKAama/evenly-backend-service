@@ -5,7 +5,10 @@
 # -------------------------------
 CONTAINER_NAME="evenly-backend-service"
 IMAGE_NAME="crpi-3xux8vqn35fw00z9.cn-shanghai.personal.cr.aliyuncs.com/project_hub/${CONTAINER_NAME}"
-IMAGE_TAG="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+VERSION_FILE="${PROJECT_DIR}/.version"
+IMAGE_TAG="${IMAGE_TAG:-$(tr -d '[:space:]' < "${VERSION_FILE}")}"
 FULL_IMAGE_NAME="${IMAGE_NAME}:${IMAGE_TAG}"
 
 # 主机配置目录
@@ -30,6 +33,10 @@ print_error() { echo -e "\033[1;31m[ERROR]\033[0m $1"; }
 # 检查环境
 # -------------------------------
 check_env() {
+    if [ ! -s "${VERSION_FILE}" ]; then
+        print_error "版本文件不存在或为空: ${VERSION_FILE}"
+        exit 1
+    fi
     if [ ! -f "${HOST_CONFIG_FILE}" ]; then
         print_error "配置文件不存在: ${HOST_CONFIG_FILE}"
         exit 1
@@ -41,6 +48,7 @@ check_env() {
 # 镜像检查与拉取
 # -------------------------------
 ensure_image() {
+    print_info "使用后端镜像版本: ${IMAGE_TAG}"
     if ! docker image inspect "${FULL_IMAGE_NAME}" >/dev/null 2>&1; then
         print_warn "镜像 ${FULL_IMAGE_NAME} 不存在，开始拉取..."
         docker pull "${FULL_IMAGE_NAME}"
@@ -175,7 +183,7 @@ show_help() {
     echo "  $0 help        显示帮助信息"
     echo
     echo "配置挂载:"
-    echo "  ${HOST_CONFIG_FILE}  →  /app/evenly-backend-service/etc/config.yaml"
+    echo "  ${HOST_CONFIG_FILE}  →  ${CONTAINER_CONFIG_PATH}"
     echo "访问端口: http://<主机IP>:${HOST_PORT}"
     echo "======================================================="
 }

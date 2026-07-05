@@ -24,9 +24,9 @@ from app.models import (
     User,
 )
 from app.routers.expenses import confirm_expense, create_expense
-from app.routers.ledgers import create_ledger, get_ledger, get_ledgers, remove_member
+from app.routers.ledgers import accept_invitation, create_ledger, get_ledger, get_ledgers, remove_member
 from app.routers import users as users_router
-from app.schemas.ledger import LedgerCreate
+from app.schemas.ledger import LedgerCreate, MemberCreate
 from app.routers.settlements import create_settlement, get_settlements
 from app.schemas.expense import ConfirmExpenseRequest, ExpenseCreate, ExpenseSplitCreate
 from app.schemas.settlement import SettlementCreate
@@ -141,6 +141,33 @@ def test_create_ledger_response_includes_owner_member_id(db):
     assert len(response.members) == 1
     assert response.members[0].id is not None
     assert response.members[0].user_id == owner.id
+
+
+def test_registered_member_must_accept_ledger_invitation(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+
+    response = create_ledger(
+        LedgerCreate(
+            name="Trip",
+            members=[MemberCreate(user_id=friend.id, nickname="Friend")],
+        ),
+        db=db,
+        current_user=owner,
+    )
+    invitation = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == response.id,
+        LedgerMember.user_id == friend.id,
+    ).one()
+
+    assert invitation.status == "pending"
+    assert get_ledgers(db=db, current_user=friend) == []
+    with pytest.raises(HTTPException) as exc_info:
+        get_ledger(response.id, db=db, current_user=friend)
+    assert_http_error(exc_info, 403)
+
+    accept_invitation(invitation.id, db=db, current_user=friend)
+    assert len(get_ledgers(db=db, current_user=friend)) == 1
 
 
 def test_ledger_summary_counts_members_and_expenses(db):
@@ -385,12 +412,16 @@ def test_only_expense_participants_confirm_and_temp_members_do_not_block(db):
     )
     expense = create_expense(ledger.id, payload, db=db, current_user=owner)
 
+    creator_confirmation = db.query(ExpenseConfirmation).filter(
+        ExpenseConfirmation.expense_id == expense.id,
+        ExpenseConfirmation.user_id == owner.id,
+    ).one()
+    assert creator_confirmation.status == "confirmed"
+    assert expense.status == ExpenseStatus.CONFIRMED
+
     with pytest.raises(HTTPException) as exc_info:
         confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=observer)
     assert_http_error(exc_info, 403)
-
-    confirmed = confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=owner)
-    assert confirmed.status == ExpenseStatus.CONFIRMED
 
 
 def test_settlement_rejects_same_user_and_non_positive_amount(db):
@@ -433,7 +464,7 @@ def test_recorded_settlement_reduces_future_settlement_suggestions(db):
         ],
     )
     expense = create_expense(ledger.id, payload, db=db, current_user=owner)
-    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=owner)
+    assert expense.status == ExpenseStatus.PENDING
     confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=friend)
 
     suggestions = get_settlements(ledger.id, db=db, current_user=owner)

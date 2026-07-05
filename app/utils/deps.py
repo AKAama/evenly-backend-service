@@ -60,6 +60,7 @@ def require_ledger_member(db: Session, ledger_id, current_user: User) -> LedgerM
         LedgerMember.ledger_id == ledger_id,
         LedgerMember.user_id == current_user.id,
         LedgerMember.is_temporary.is_(False),
+        LedgerMember.status == "active",
     ).first()
 
     if not membership:

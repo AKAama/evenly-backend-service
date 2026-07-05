@@ -14,6 +14,7 @@ from app.schemas.ledger import (
     AddMemberRequest,
     MemberResponse,
     MemberCreate,
+    LedgerInvitationResponse,
 )
 from app.schemas.user import UserResponse
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
@@ -59,6 +60,7 @@ def create_ledger(
         ledger_id=db_ledger.id,
         user_id=current_user.id,
         nickname=current_user.display_name,
+        status="active",
     )
     db.add(owner_member)
     db.flush()
@@ -77,6 +79,7 @@ def create_ledger(
                 nickname=member_data.temporary_name,
                 is_temporary=True,
                 temporary_name=member_data.temporary_name,
+                status="active",
             )
         else:
             # Regular member - must have user_id
@@ -90,6 +93,8 @@ def create_ledger(
                 ledger_id=db_ledger.id,
                 user_id=member_data.user_id,
                 nickname=member_data.nickname or user.display_name,
+                status="pending",
+                invited_by=current_user.id,
             )
         
         db.add(member)
@@ -98,15 +103,17 @@ def create_ledger(
         
         # Build member response
         member_user = db.query(User).filter(User.id == member.user_id).first() if member.user_id and not member.is_temporary else None
-        member_responses.append(MemberResponse(
+        if member.status == "active":
+            member_responses.append(MemberResponse(
             id=member.id,
             user_id=member.user_id,
             nickname=member.nickname,
             joined_at=member.joined_at,
             user=UserResponse.model_validate(member_user) if member_user else None,
             is_temporary=member.is_temporary,
-            temporary_name=member.temporary_name
-        ))
+                temporary_name=member.temporary_name,
+                status=member.status,
+            ))
 
     db.commit()
 
@@ -143,12 +150,15 @@ def get_ledgers(
     current_user: User = Depends(get_current_user)
 ):
     """Get all ledgers the current user is a member of"""
-    member_query = db.query(LedgerMember).filter(LedgerMember.user_id == current_user.id)
+    member_query = db.query(LedgerMember).filter(
+        LedgerMember.user_id == current_user.id,
+        LedgerMember.status == "active",
+    )
     member_ledger_ids = [m.ledger_id for m in member_query.all()]
 
     member_count = (
         db.query(func.count(LedgerMember.id))
-        .filter(LedgerMember.ledger_id == Ledger.id)
+        .filter(LedgerMember.ledger_id == Ledger.id, LedgerMember.status == "active")
         .correlate(Ledger)
         .scalar_subquery()
     )
@@ -177,6 +187,67 @@ def get_ledgers(
     ]
 
 
+@router.get("/invitations/pending", response_model=List[LedgerInvitationResponse])
+def get_pending_invitations(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    rows = (
+        db.query(LedgerMember, Ledger, User)
+        .join(Ledger, Ledger.id == LedgerMember.ledger_id)
+        .join(User, User.id == LedgerMember.invited_by)
+        .filter(
+            LedgerMember.user_id == current_user.id,
+            LedgerMember.status == "pending",
+        )
+        .all()
+    )
+    return [
+        LedgerInvitationResponse(
+            id=membership.id,
+            ledger_id=ledger.id,
+            ledger_name=ledger.name,
+            invited_by_name=inviter.display_name,
+            created_at=membership.joined_at,
+        )
+        for membership, ledger, inviter in rows
+    ]
+
+
+@router.post("/invitations/{invitation_id}/accept", status_code=status.HTTP_204_NO_CONTENT)
+def accept_invitation(
+    invitation_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    invitation = db.query(LedgerMember).filter(
+        LedgerMember.id == invitation_id,
+        LedgerMember.user_id == current_user.id,
+        LedgerMember.status == "pending",
+    ).first()
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    invitation.status = "active"
+    db.commit()
+
+
+@router.post("/invitations/{invitation_id}/reject", status_code=status.HTTP_204_NO_CONTENT)
+def reject_invitation(
+    invitation_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    invitation = db.query(LedgerMember).filter(
+        LedgerMember.id == invitation_id,
+        LedgerMember.user_id == current_user.id,
+        LedgerMember.status == "pending",
+    ).first()
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    db.delete(invitation)
+    db.commit()
+
+
 @router.get("/{ledger_id}", response_model=LedgerWithMembers)
 def get_ledger(
     ledger_id: UUID,
@@ -188,7 +259,10 @@ def get_ledger(
     require_ledger_member(db, ledger_id, current_user)
 
     # Get members with user details
-    members = db.query(LedgerMember).filter(LedgerMember.ledger_id == ledger_id).all()
+    members = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == ledger_id,
+        LedgerMember.status == "active",
+    ).all()
     member_responses = []
     for m in members:
         user = db.query(User).filter(User.id == m.user_id).first() if m.user_id and not m.is_temporary else None
@@ -324,11 +398,13 @@ def add_member(
         ledger_id=ledger_id,
         user_id=request.user_id,
         nickname=request.nickname or user.display_name,
+        status="pending",
+        invited_by=current_user.id,
     )
     db.add(member)
     db.commit()
     db.refresh(member)
-    logger.info("Added regular member ledger_id=%s member_id=%s user_id=%s", ledger_id, member.id, request.user_id)
+    logger.info("Invited regular member ledger_id=%s member_id=%s user_id=%s", ledger_id, member.id, request.user_id)
 
     return MemberResponse(
         id=member.id,
@@ -337,7 +413,8 @@ def add_member(
         joined_at=member.joined_at,
         user=UserResponse.model_validate(user),
         is_temporary=False,
-        temporary_name=None
+        temporary_name=None,
+        status="pending",
     )
 
 
@@ -350,7 +427,10 @@ def get_members(
     """Get all members of a ledger"""
     require_ledger_member(db, ledger_id, current_user)
 
-    members = db.query(LedgerMember).filter(LedgerMember.ledger_id == ledger_id).all()
+    members = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == ledger_id,
+        LedgerMember.status == "active",
+    ).all()
     result = []
     for m in members:
         user = db.query(User).filter(User.id == m.user_id).first() if m.user_id and not m.is_temporary else None

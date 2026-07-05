@@ -44,7 +44,10 @@ def create_expense(
     if not expense.splits:
         raise HTTPException(status_code=400, detail="At least one split is required")
 
-    members = db.query(LedgerMember).filter(LedgerMember.ledger_id == ledger_id).all()
+    members = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == ledger_id,
+        LedgerMember.status == "active",
+    ).all()
     members_by_id = {member.id: member for member in members}
     members_by_user_id = {
         member.user_id: member for member in members if member.user_id is not None
@@ -112,6 +115,21 @@ def create_expense(
         )
         db.add(db_split)
 
+    # Creating an expense is itself the creator's acknowledgement. Record it
+    # immediately when the creator is one of the registered participants, so
+    # they are never asked to confirm their own expense again.
+    registered_participant_ids = {
+        member.user_id for _, member in resolved_splits if member.user_id is not None
+    }
+    if current_user.id in registered_participant_ids:
+        db.add(ExpenseConfirmation(
+            expense_id=db_expense.id,
+            user_id=current_user.id,
+            status="confirmed",
+        ))
+        if not (registered_participant_ids - {current_user.id}):
+            db_expense.status = ExpenseStatus.CONFIRMED
+
     db.commit()
     db.refresh(db_expense)
 
@@ -135,6 +153,11 @@ def get_expenses(
         payer = db.query(User).filter(User.id == exp.payer_id).first()
         splits = db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == exp.id).all()
         confirmations = db.query(ExpenseConfirmation).filter(ExpenseConfirmation.expense_id == exp.id).all()
+        if exp.status == ExpenseStatus.PENDING:
+            required_ids = {s.user_id for s in splits if s.user_id is not None} - {exp.created_by}
+            confirmed_ids = {c.user_id for c in confirmations if c.status == "confirmed"}
+            if required_ids <= confirmed_ids:
+                exp.status = ExpenseStatus.CONFIRMED
 
         response = ExpenseWithDetails(
             id=exp.id,
@@ -173,6 +196,8 @@ def get_expenses(
         )
         result.append(response)
 
+    if db.dirty:
+        db.commit()
     return result
 
 
@@ -196,6 +221,8 @@ def confirm_expense(
         for s in db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == expense_id).all()
         if s.user_id is not None
     }
+    if current_user.id == expense.created_by:
+        raise HTTPException(status_code=400, detail="Expense creator does not need to confirm")
     if current_user.id not in split_participants:
         raise HTTPException(status_code=403, detail="Only expense participants can confirm this expense")
 
@@ -234,7 +261,8 @@ def confirm_expense(
         ).all()
         confirmed_ids = {c.user_id for c in confirmations}
 
-        if split_participants <= confirmed_ids:
+        required_participants = split_participants - {expense.created_by}
+        if required_participants <= confirmed_ids:
             expense.status = ExpenseStatus.CONFIRMED
 
     elif request.status == "rejected":

@@ -67,3 +67,12 @@ class MemberResponse(BaseModel):
     user: UserResponse | None = None  # None for temporary members
     is_temporary: bool = False
     temporary_name: str | None = None
+    status: str = "active"
+
+
+class LedgerInvitationResponse(BaseModel):
+    id: UUID
+    ledger_id: UUID
+    ledger_name: str
+    invited_by_name: str
+    created_at: datetime
