@@ -515,9 +515,10 @@ def remove_member(
     if not membership:
         raise HTTPException(status_code=404, detail="Member not found")
 
-    # Check permission: owner can remove anyone, members can only remove themselves.
-    if current_user.id != ledger.owner_id and membership.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized to remove this member")
+    # Removing members is an owner-only operation. Members who want to leave
+    # must use the dedicated /members/me endpoint.
+    if current_user.id != ledger.owner_id:
+        raise HTTPException(status_code=403, detail="Only owner can remove members")
 
     # Owner cannot remove themselves
     if membership.user_id == ledger.owner_id:

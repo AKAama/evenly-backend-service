@@ -540,6 +540,18 @@ def test_non_owner_cannot_remove_temporary_member_by_member_id(db):
     assert_http_error(exc_info, 403)
 
 
+def test_member_cannot_remove_self_through_owner_endpoint(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+
+    with pytest.raises(HTTPException) as exc_info:
+        remove_member(ledger.id, friend.id, db=db, current_user=friend)
+
+    assert_http_error(exc_info, 403)
+
+
 def test_verification_code_is_rate_limited_and_consumed(monkeypatch):
     verification.verification_codes.clear()
     monkeypatch.setattr(verification.settings, "redis_url", None)
