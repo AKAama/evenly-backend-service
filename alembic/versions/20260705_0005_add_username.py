@@ -4,7 +4,6 @@ Revision ID: 20260705_0005
 Revises: 20260705_0004
 """
 from alembic import op
-import sqlalchemy as sa
 
 revision = "20260705_0005"
 down_revision = "20260705_0004"
@@ -13,12 +12,25 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column("users", sa.Column("username", sa.String(30), nullable=True))
-    op.execute("UPDATE users SET username = 'user_' || left(replace(id::text, '-', ''), 12) WHERE username IS NULL")
-    op.alter_column("users", "username", nullable=False)
-    op.create_index("uq_users_username_lower", "users", [sa.text("lower(username)")], unique=True)
+    # Production may already have this column from a manual hotfix. Keep the
+    # migration safe to rerun so Alembic can still record the revision.
+    op.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(30)")
+    op.execute(
+        """
+        UPDATE users
+        SET username = 'user_' || left(replace(id::text, '-', ''), 12)
+        WHERE username IS NULL
+        """
+    )
+    op.execute("ALTER TABLE users ALTER COLUMN username SET NOT NULL")
+    op.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_users_username_lower
+        ON users (lower(username))
+        """
+    )
 
 
 def downgrade():
-    op.drop_index("uq_users_username_lower", table_name="users")
-    op.drop_column("users", "username")
+    op.execute("DROP INDEX IF EXISTS uq_users_username_lower")
+    op.execute("ALTER TABLE users DROP COLUMN IF EXISTS username")
