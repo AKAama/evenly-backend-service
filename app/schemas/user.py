@@ -1,6 +1,6 @@
 from datetime import datetime
 from uuid import UUID
-from pydantic import BaseModel, EmailStr, ConfigDict
+from pydantic import BaseModel, EmailStr, ConfigDict, Field
 
 
 # User schemas
@@ -37,10 +37,26 @@ class TokenData(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    display_name: str | None = None
+    display_name: str | None = Field(default=None, min_length=1, max_length=100)
     avatar_url: str | None = None
 
 
 class PasswordChange(BaseModel):
     old_password: str
     new_password: str
+
+
+class EmailChange(BaseModel):
+    new_email: EmailStr
+    code: str
+    password: str
+
+
+class EmailChangeCodeRequest(BaseModel):
+    new_email: EmailStr
+
+
+class PasswordReset(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str = Field(min_length=6)

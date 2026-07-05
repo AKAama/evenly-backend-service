@@ -14,12 +14,12 @@ class SettlementCalculator:
         self.ledger_id = ledger_id
 
     def get_confirmed_expenses(self) -> list[Expense]:
-        """Get all confirmed expenses for the ledger"""
+        """Get all non-rejected expenses for the ledger."""
         return (
             self.db.query(Expense)
             .filter(
                 Expense.ledger_id == self.ledger_id,
-                Expense.status == ExpenseStatus.CONFIRMED
+                Expense.status != ExpenseStatus.REJECTED
             )
             .all()
         )
@@ -50,7 +50,7 @@ class SettlementCalculator:
             .join(Expense)
             .filter(
                 Expense.ledger_id == self.ledger_id,
-                Expense.status == ExpenseStatus.CONFIRMED,
+                Expense.status != ExpenseStatus.REJECTED,
                 ExpenseSplit.user_id.in_(member_ids)
             )
             .group_by(ExpenseSplit.user_id)
@@ -64,7 +64,7 @@ class SettlementCalculator:
             self.db.query(Expense.payer_id, func.sum(Expense.total_amount))
             .filter(
                 Expense.ledger_id == self.ledger_id,
-                Expense.status == ExpenseStatus.CONFIRMED,
+                Expense.status != ExpenseStatus.REJECTED,
                 Expense.payer_id.in_(member_ids)
             )
             .group_by(Expense.payer_id)
@@ -79,18 +79,6 @@ class SettlementCalculator:
             owed = owed_dict.get(member.user_id, Decimal("0"))
             paid = paid_dict.get(member.user_id, Decimal("0"))
             net_balances[member.user_id] = paid - owed
-
-        recorded_settlements = (
-            self.db.query(Settlement)
-            .filter(Settlement.ledger_id == self.ledger_id)
-            .all()
-        )
-        for settlement in recorded_settlements:
-            amount = Decimal(str(settlement.amount or 0))
-            if settlement.from_user_id in net_balances:
-                net_balances[settlement.from_user_id] += amount
-            if settlement.to_user_id in net_balances:
-                net_balances[settlement.to_user_id] -= amount
 
         return net_balances
 

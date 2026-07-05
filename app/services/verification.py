@@ -26,12 +26,12 @@ def _normalize_email(email: str) -> str:
     return email.strip().lower()
 
 
-def _code_key(email: str) -> str:
-    return f"evenly:verification:code:{email}"
+def _code_key(email: str, purpose: str) -> str:
+    return f"evenly:verification:{purpose}:code:{email}"
 
 
-def _send_lock_key(email: str) -> str:
-    return f"evenly:verification:sent:{email}"
+def _send_lock_key(email: str, purpose: str) -> str:
+    return f"evenly:verification:{purpose}:sent:{email}"
 
 
 def _get_redis_client() -> Redis | None:
@@ -43,13 +43,14 @@ def _get_redis_client() -> Redis | None:
     return _redis_client
 
 
-def _send_with_memory_store(email: str, code: str) -> bool:
+def _send_with_memory_store(email: str, code: str, purpose: str) -> bool:
     now = time.time()
-    existing = verification_codes.get(email)
+    key = f"{purpose}:{email}"
+    existing = verification_codes.get(key)
     if existing and now - existing.get("sent_at", 0) < settings.verification_send_interval_seconds:
         return False
 
-    verification_codes[email] = {
+    verification_codes[key] = {
         "code": code,
         "expires_at": now + settings.verification_code_expire_seconds,
         "sent_at": now,
@@ -57,14 +58,14 @@ def _send_with_memory_store(email: str, code: str) -> bool:
     return True
 
 
-def _send_with_redis(email: str, code: str) -> bool | None:
+def _send_with_redis(email: str, code: str, purpose: str) -> bool | None:
     redis_client = _get_redis_client()
     if redis_client is None:
         return None
 
     try:
         locked = redis_client.set(
-            _send_lock_key(email),
+            _send_lock_key(email, purpose),
             "1",
             ex=settings.verification_send_interval_seconds,
             nx=True,
@@ -73,7 +74,7 @@ def _send_with_redis(email: str, code: str) -> bool | None:
             return False
 
         redis_client.set(
-            _code_key(email),
+            _code_key(email, purpose),
             code,
             ex=settings.verification_code_expire_seconds,
         )
@@ -83,49 +84,50 @@ def _send_with_redis(email: str, code: str) -> bool | None:
         return None
 
 
-def _verify_with_redis(email: str, code: str) -> bool | None:
+def _verify_with_redis(email: str, code: str, purpose: str) -> bool | None:
     redis_client = _get_redis_client()
     if redis_client is None:
         return None
 
     try:
-        key = _code_key(email)
+        key = _code_key(email, purpose)
         stored_code = redis_client.get(key)
         if stored_code != code:
             return False
 
         redis_client.delete(key)
-        redis_client.delete(_send_lock_key(email))
+        redis_client.delete(_send_lock_key(email, purpose))
         return True
     except RedisError:
         logger.exception("Redis verification store unavailable; falling back to in-memory store")
         return None
 
 
-def _verify_with_memory_store(email: str, code: str) -> bool:
-    stored = verification_codes.get(email)
+def _verify_with_memory_store(email: str, code: str, purpose: str) -> bool:
+    key = f"{purpose}:{email}"
+    stored = verification_codes.get(key)
     if not stored:
         return False
 
     if time.time() > stored["expires_at"]:
-        verification_codes.pop(email, None)
+        verification_codes.pop(key, None)
         return False
 
     if stored["code"] == code:
-        verification_codes.pop(email, None)
+        verification_codes.pop(key, None)
         return True
 
     return False
 
 
-def send_verification_code(email: str) -> bool:
+def send_verification_code(email: str, purpose: str = "register") -> bool:
     """Send a verification code to an email address."""
     normalized_email = _normalize_email(email)
     code = generate_code()
 
-    stored = _send_with_redis(normalized_email, code)
+    stored = _send_with_redis(normalized_email, code, purpose)
     if stored is None:
-        stored = _send_with_memory_store(normalized_email, code)
+        stored = _send_with_memory_store(normalized_email, code, purpose)
     if not stored:
         return False
 
@@ -139,10 +141,10 @@ def send_verification_code(email: str) -> bool:
     return True
 
 
-def verify_code(email: str, code: str) -> bool:
+def verify_code(email: str, code: str, purpose: str = "register") -> bool:
     """Verify and consume a verification code."""
     normalized_email = _normalize_email(email)
-    result = _verify_with_redis(normalized_email, code)
+    result = _verify_with_redis(normalized_email, code, purpose)
     if result is not None:
         return result
-    return _verify_with_memory_store(normalized_email, code)
+    return _verify_with_memory_store(normalized_email, code, purpose)

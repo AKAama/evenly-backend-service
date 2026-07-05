@@ -103,8 +103,7 @@ def create_ledger(
         
         # Build member response
         member_user = db.query(User).filter(User.id == member.user_id).first() if member.user_id and not member.is_temporary else None
-        if member.status == "active":
-            member_responses.append(MemberResponse(
+        member_responses.append(MemberResponse(
             id=member.id,
             user_id=member.user_id,
             nickname=member.nickname,
@@ -112,8 +111,8 @@ def create_ledger(
             user=UserResponse.model_validate(member_user) if member_user else None,
             is_temporary=member.is_temporary,
                 temporary_name=member.temporary_name,
-                status=member.status,
-            ))
+            status=member.status,
+        ))
 
     db.commit()
 

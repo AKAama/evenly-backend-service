@@ -8,8 +8,8 @@ from typing import Annotated
 from pydantic import BaseModel, EmailStr
 
 from app.database import get_db
-from app.schemas.user import UserCreate, UserResponse, Token
-from app.services.auth import create_user, authenticate_user, create_access_token, get_user_by_email, get_user_by_username
+from app.schemas.user import UserCreate, UserResponse, Token, PasswordReset
+from app.services.auth import create_user, authenticate_user, create_access_token, get_user_by_email, get_user_by_username, get_password_hash
 from app.services.cos import get_cos_service
 from app.services.verification import send_verification_code, verify_code
 from app.config import settings
@@ -219,3 +219,22 @@ def login(
 def logout(response: Response):
     clear_auth_cookie(response)
     return {"message": "Logged out"}
+
+
+@router.post("/password-reset/send")
+def send_password_reset_code(request: SendCodeRequest, db: Session = Depends(get_db)):
+    # Always return the same response to avoid revealing registered emails.
+    if get_user_by_email(db, request.email):
+        if not send_verification_code(request.email, purpose="password_reset"):
+            raise HTTPException(status_code=429, detail="发送过于频繁，请稍后重试")
+    return {"message": "如果该邮箱已注册，验证码将发送至邮箱"}
+
+
+@router.post("/password-reset")
+def reset_password(request: PasswordReset, db: Session = Depends(get_db)):
+    user = get_user_by_email(db, request.email)
+    if not user or not verify_code(request.email, request.code, purpose="password_reset"):
+        raise HTTPException(status_code=400, detail="验证码错误或已过期")
+    user.password_hash = get_password_hash(request.new_password)
+    db.commit()
+    return {"message": "密码已重置"}

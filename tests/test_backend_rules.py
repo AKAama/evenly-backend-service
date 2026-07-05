@@ -449,7 +449,7 @@ def test_settlement_rejects_same_user_and_non_positive_amount(db):
     assert_http_error(exc_info, 400)
 
 
-def test_recorded_settlement_reduces_future_settlement_suggestions(db):
+def test_recorded_settlement_does_not_change_complete_settlement_plan(db):
     owner = make_user(db, "owner@example.com", "Owner")
     friend = make_user(db, "friend@example.com", "Friend")
     ledger = make_ledger(db, owner)
@@ -486,7 +486,7 @@ def test_recorded_settlement_reduces_future_settlement_suggestions(db):
     )
 
     suggestions = get_settlements(ledger.id, db=db, current_user=owner)
-    assert suggestions[0].amount == Decimal("3.00")
+    assert suggestions[0].amount == Decimal("5.00")
 
 
 def test_cannot_remove_member_with_expense_history(db):
@@ -578,6 +578,18 @@ def test_expired_verification_code_is_rejected(monkeypatch):
 
     assert verification.send_verification_code("user@example.com") is True
     assert verification.verify_code("user@example.com", "654321") is False
+
+
+def test_verification_codes_are_isolated_by_purpose(monkeypatch):
+    verification.verification_codes.clear()
+    monkeypatch.setattr(verification.settings, "redis_url", None)
+    monkeypatch.setattr(verification, "_redis_client", None)
+    monkeypatch.setattr(verification, "generate_code", lambda length=6: "112233")
+    monkeypatch.setattr("app.services.email.get_email_service", lambda: None)
+
+    assert verification.send_verification_code("user@example.com", purpose="email_change") is True
+    assert verification.verify_code("user@example.com", "112233", purpose="password_reset") is False
+    assert verification.verify_code("user@example.com", "112233", purpose="email_change") is True
 
 
 def test_web_login_sets_http_only_cookie_and_logout_clears_it(db, client):

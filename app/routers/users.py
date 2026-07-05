@@ -14,10 +14,11 @@ from app.models import (
     ExpenseConfirmation,
     Settlement,
 )
-from app.schemas.user import UserResponse, UserUpdate, PasswordChange
+from app.schemas.user import UserResponse, UserUpdate, PasswordChange, EmailChange, EmailChangeCodeRequest
 from app.utils.deps import get_current_user
 from app.services.cos import get_cos_service
-from app.services.auth import verify_password, get_password_hash
+from app.services.auth import verify_password, get_password_hash, get_user_by_email
+from app.services.verification import send_verification_code, verify_code
 from app.config import settings
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -125,7 +126,10 @@ def update_user_info(
 ):
     """Update current user information (display_name)"""
     if user_update.display_name is not None:
-        current_user.display_name = user_update.display_name
+        display_name = user_update.display_name.strip()
+        if not display_name:
+            raise HTTPException(status_code=400, detail="Display name cannot be blank")
+        current_user.display_name = display_name
     if user_update.avatar_url is not None:
         current_user.avatar_url = user_update.avatar_url
 
@@ -153,6 +157,41 @@ def change_password(
     db.commit()
 
     return {"message": "Password updated successfully"}
+
+
+@router.post("/me/email/send-verification")
+def send_email_change_code(
+    request: EmailChangeCodeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    new_email = str(request.new_email).strip().lower()
+    if new_email == current_user.email.lower():
+        raise HTTPException(status_code=400, detail="新邮箱不能与当前邮箱相同")
+    if get_user_by_email(db, new_email):
+        raise HTTPException(status_code=400, detail="该邮箱已被使用")
+    if not send_verification_code(new_email, purpose="email_change"):
+        raise HTTPException(status_code=429, detail="发送过于频繁，请稍后重试")
+    return {"message": "验证码已发送"}
+
+
+@router.put("/me/email", response_model=UserResponse)
+def change_email(
+    request: EmailChange,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    new_email = str(request.new_email).strip().lower()
+    if not verify_password(request.password, current_user.password_hash):
+        raise HTTPException(status_code=400, detail="当前密码错误")
+    if get_user_by_email(db, new_email):
+        raise HTTPException(status_code=400, detail="该邮箱已被使用")
+    if not verify_code(new_email, request.code, purpose="email_change"):
+        raise HTTPException(status_code=400, detail="验证码错误或已过期")
+    current_user.email = new_email
+    db.commit()
+    db.refresh(current_user)
+    return current_user
 
 
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)

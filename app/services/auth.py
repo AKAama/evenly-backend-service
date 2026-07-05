@@ -47,7 +47,7 @@ def decode_token(token: str) -> TokenData | None:
 
 
 def get_user_by_email(db: Session, email: str) -> User | None:
-    return db.query(User).filter(User.email == email).first()
+    return db.query(User).filter(func.lower(User.email) == email.strip().lower()).first()
 
 
 def get_user_by_username(db: Session, username: str) -> User | None:
@@ -61,7 +61,7 @@ def get_user_by_id(db: Session, user_id: UUID) -> User | None:
 def create_user(db: Session, user: UserCreate) -> User:
     hashed_password = get_password_hash(user.password)
     db_user = User(
-        email=user.email,
+        email=str(user.email).strip().lower(),
         username=user.username,
         password_hash=hashed_password,
         display_name=user.display_name,
