@@ -295,6 +295,9 @@ def delete_expense(
     if not expense:
         raise HTTPException(status_code=404, detail="Expense not found")
 
+    # Defensive: caller must be an active member of the ledger this expense belongs to
+    require_ledger_member(db, expense.ledger_id, current_user)
+
     if expense.created_by != current_user.id:
         raise HTTPException(status_code=403, detail="Only creator can delete this expense")
 
