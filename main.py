@@ -1,4 +1,5 @@
 import logging
+from time import perf_counter
 
 from fastapi import FastAPI
 from fastapi import HTTPException, Request
@@ -19,6 +20,31 @@ app = FastAPI(
     description="Backend API for collaborative expense tracking and settlement",
     version="1.0.0"
 )
+
+
+@app.middleware("http")
+async def request_timing_middleware(request: Request, call_next):
+    started_at = perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        elapsed_ms = (perf_counter() - started_at) * 1000
+        response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
+        response.headers["Server-Timing"] = f'app;dur={elapsed_ms:.2f};desc="FastAPI"'
+        return response
+    finally:
+        elapsed_ms = (perf_counter() - started_at) * 1000
+        is_slow = elapsed_ms >= settings.slow_request_threshold_ms
+        logger.log(
+            logging.WARNING if is_slow else logging.INFO,
+            "HTTP %s %s status=%d duration_ms=%.2f slow=%s",
+            request.method,
+            request.url.path,
+            status_code,
+            elapsed_ms,
+            str(is_slow).lower(),
+        )
 
 
 @app.exception_handler(SQLAlchemyError)

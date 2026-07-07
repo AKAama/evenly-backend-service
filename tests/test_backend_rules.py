@@ -14,6 +14,7 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base
 from app.database import get_db
 from app.models import (
+    AuthIdentity,
     Expense,
     ExpenseConfirmation,
     ExpenseSplit,
@@ -67,14 +68,23 @@ def make_user(db, email, display_name):
 
 
 def make_login_user(db, email, display_name, password="secret123"):
+    password_hash = get_password_hash(password)
     user = User(
         id=uuid.uuid4(),
         email=email,
         username=email.split("@", 1)[0],
         display_name=display_name,
-        password_hash=get_password_hash(password),
+        password_hash=password_hash,
     )
     db.add(user)
+    db.flush()
+    db.add(AuthIdentity(
+        user_id=user.id,
+        provider="password",
+        provider_subject=email.lower(),
+        email=email.lower(),
+        password_hash=password_hash,
+    ))
     db.commit()
     db.refresh(user)
     return user
@@ -690,6 +700,34 @@ def test_web_login_sets_http_only_cookie_and_logout_clears_it(db, client):
     assert "Max-Age=0" in logout_response.headers["set-cookie"]
 
 
+def test_responses_include_server_timing_headers(client):
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert float(response.headers["X-Process-Time-Ms"]) >= 0
+    assert response.headers["Server-Timing"].startswith("app;dur=")
+
+
+def test_ledger_overview_returns_main_screen_payload(db, client):
+    user = make_login_user(db, "owner@example.com", "Owner")
+    ledger = make_ledger(db, user)
+    login_response = client.post(
+        "/auth/login",
+        data={"username": "owner@example.com", "password": "secret123"},
+    )
+    assert login_response.status_code == 200
+
+    response = client.get(f"/ledgers/{ledger.id}/overview")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ledger"]["id"] == str(ledger.id)
+    assert len(payload["ledger"]["members"]) == 1
+    assert payload["expenses"] == []
+    assert payload["settlement_suggestions"] == []
+    assert payload["settlement_history"] == []
+
+
 def test_login_accepts_case_insensitive_username(db, client):
     make_login_user(db, "owner@example.com", "Owner")
 
@@ -699,6 +737,99 @@ def test_login_accepts_case_insensitive_username(db, client):
     )
 
     assert response.status_code == 200
+
+
+def test_password_login_uses_identity_credentials(db, client):
+    user = make_login_user(db, "owner@example.com", "Owner")
+    identity = db.query(AuthIdentity).filter_by(user_id=user.id, provider="password").one()
+    identity.password_hash = get_password_hash("identity-password")
+    db.commit()
+
+    old_response = client.post(
+        "/auth/login",
+        data={"username": "owner@example.com", "password": "secret123"},
+    )
+    new_response = client.post(
+        "/auth/login",
+        data={"username": "owner@example.com", "password": "identity-password"},
+    )
+
+    assert old_response.status_code == 401
+    assert new_response.status_code == 200
+
+
+def test_apple_login_creates_identity_and_reuses_account(db, client, monkeypatch):
+    claims = {
+        "sub": "apple-user-123",
+        "email": "apple@example.com",
+        "email_verified": True,
+    }
+    monkeypatch.setattr(
+        "app.routers.auth.verify_apple_identity_token",
+        lambda identity_token, nonce: claims,
+    )
+
+    first = client.post(
+        "/auth/apple",
+        json={"identity_token": "token", "nonce": "nonce", "full_name": "Apple User"},
+    )
+    second = client.post(
+        "/auth/apple",
+        json={"identity_token": "token", "nonce": "nonce"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert db.query(User).filter(User.email == "apple@example.com").count() == 1
+    identity = db.query(AuthIdentity).filter_by(
+        provider="apple", provider_subject="apple-user-123"
+    ).one()
+    assert identity.user.display_name == "Apple User"
+    assert identity.user.username_is_generated is True
+
+
+def test_apple_user_can_choose_username_and_set_password(db, client, monkeypatch):
+    verification.verification_codes.clear()
+    monkeypatch.setattr(verification.settings, "redis_url", None)
+    monkeypatch.setattr(verification, "_redis_client", None)
+    monkeypatch.setattr(verification, "generate_code", lambda length=6: "246810")
+    monkeypatch.setattr("app.services.email.get_email_service", lambda: None)
+    monkeypatch.setattr(
+        "app.routers.auth.verify_apple_identity_token",
+        lambda identity_token, nonce: {
+            "sub": "apple-setup-user",
+            "email": "setup@example.com",
+            "email_verified": True,
+        },
+    )
+    assert client.post(
+        "/auth/apple",
+        json={"identity_token": "token", "nonce": "nonce"},
+    ).status_code == 200
+
+    methods = client.get("/users/me/auth-methods").json()
+    assert methods == {"methods": ["apple"], "has_password": False}
+
+    username_response = client.put(
+        "/users/me/username", json={"username": "apple_friend"}
+    )
+    assert username_response.status_code == 200
+    assert username_response.json()["username_is_generated"] is False
+
+    assert client.post("/users/me/password/setup/send").status_code == 200
+    setup_response = client.put(
+        "/users/me/password/setup",
+        json={"code": "246810", "new_password": "new-secret"},
+    )
+    assert setup_response.status_code == 200
+    assert client.get("/users/me/auth-methods").json() == {
+        "methods": ["apple", "password"],
+        "has_password": True,
+    }
+    assert client.post(
+        "/auth/login",
+        data={"username": "apple_friend", "password": "new-secret"},
+    ).status_code == 200
 
 
 def test_get_ledger_returns_pending_members_with_status(db):

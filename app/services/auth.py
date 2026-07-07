@@ -6,7 +6,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import User
+from app.models import AuthIdentity, User
 from app.schemas.user import TokenData, UserCreate, UserLogin
 
 
@@ -58,6 +58,45 @@ def get_user_by_id(db: Session, user_id: UUID) -> User | None:
     return db.query(User).filter(User.id == user_id).first()
 
 
+def get_password_identity(db: Session, user_id: UUID) -> AuthIdentity | None:
+    return db.query(AuthIdentity).filter(
+        AuthIdentity.user_id == user_id,
+        AuthIdentity.provider == "password",
+    ).first()
+
+
+def set_password(db: Session, user: User, password: str) -> None:
+    """Update the password identity and the legacy compatibility column."""
+    password_hash = get_password_hash(password)
+    identity = get_password_identity(db, user.id)
+    if identity is None:
+        identity = AuthIdentity(
+            user_id=user.id,
+            provider="password",
+            provider_subject=user.email.strip().lower(),
+            email=user.email.strip().lower(),
+        )
+        db.add(identity)
+    identity.password_hash = password_hash
+    user.password_hash = password_hash
+
+
+def change_password_email(db: Session, user: User, new_email: str) -> None:
+    """Move the password login identifier while preserving the same account."""
+    normalized_email = new_email.strip().lower()
+    identity = get_password_identity(db, user.id)
+    if identity is None:
+        identity = AuthIdentity(
+            user_id=user.id,
+            provider="password",
+            password_hash=user.password_hash,
+        )
+        db.add(identity)
+    identity.provider_subject = normalized_email
+    identity.email = normalized_email
+    user.email = normalized_email
+
+
 def create_user(db: Session, user: UserCreate) -> User:
     hashed_password = get_password_hash(user.password)
     db_user = User(
@@ -68,6 +107,14 @@ def create_user(db: Session, user: UserCreate) -> User:
         avatar_url=user.avatar_url,
     )
     db.add(db_user)
+    db.flush()
+    db.add(AuthIdentity(
+        user_id=db_user.id,
+        provider="password",
+        provider_subject=str(user.email).strip().lower(),
+        email=str(user.email).strip().lower(),
+        password_hash=hashed_password,
+    ))
     db.commit()
     db.refresh(db_user)
     return db_user
@@ -75,12 +122,15 @@ def create_user(db: Session, user: UserCreate) -> User:
 
 def authenticate_user(db: Session, user_login: UserLogin) -> User | None:
     identifier = user_login.identifier.strip()
-    user = db.query(User).filter(or_(
-        func.lower(User.email) == identifier.lower(),
-        func.lower(User.username) == identifier.lower(),
-    )).first()
-    if not user:
+    identity = db.query(AuthIdentity).join(User).filter(
+        AuthIdentity.provider == "password",
+        or_(
+            func.lower(AuthIdentity.provider_subject) == identifier.lower(),
+            func.lower(User.username) == identifier.lower(),
+        ),
+    ).first()
+    if not identity or not identity.password_hash:
         return None
-    if not verify_password(user_login.password, user.password_hash):
+    if not verify_password(user_login.password, identity.password_hash):
         return None
-    return user
+    return identity.user

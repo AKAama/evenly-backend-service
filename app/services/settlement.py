@@ -12,6 +12,7 @@ class SettlementCalculator:
     def __init__(self, db: Session, ledger_id: UUID):
         self.db = db
         self.ledger_id = ledger_id
+        self._members: list[LedgerMember] | None = None
 
     def get_confirmed_expenses(self) -> list[Expense]:
         """Get all non-rejected expenses for the ledger."""
@@ -26,14 +27,16 @@ class SettlementCalculator:
 
     def get_ledger_members(self) -> list[LedgerMember]:
         """Get active members of the ledger (pending invitations don't participate in balances)"""
-        return (
-            self.db.query(LedgerMember)
-            .filter(
-                LedgerMember.ledger_id == self.ledger_id,
-                LedgerMember.status == "active",
+        if self._members is None:
+            self._members = (
+                self.db.query(LedgerMember)
+                .filter(
+                    LedgerMember.ledger_id == self.ledger_id,
+                    LedgerMember.status == "active",
+                )
+                .all()
             )
-            .all()
-        )
+        return self._members
 
     def calculate_net_balances(self) -> dict[UUID, Decimal]:
         """

@@ -1,5 +1,7 @@
 import logging
 import re
+import secrets
+import hashlib
 from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException, Response, status, UploadFile, File, Form
 from fastapi.security import OAuth2PasswordRequestForm
@@ -8,8 +10,10 @@ from typing import Annotated
 from pydantic import BaseModel, EmailStr
 
 from app.database import get_db
-from app.schemas.user import UserCreate, UserResponse, Token, PasswordReset
-from app.services.auth import create_user, authenticate_user, create_access_token, get_user_by_email, get_user_by_username, get_password_hash
+from app.models import AuthIdentity, User
+from app.schemas.user import AppleLoginRequest, UserCreate, UserResponse, Token, PasswordReset
+from app.services.auth import create_user, authenticate_user, create_access_token, get_password_hash, get_user_by_email, get_user_by_username, set_password
+from app.services.apple_auth import AppleTokenError, verify_apple_identity_token
 from app.services.cos import get_cos_service
 from app.services.verification import send_verification_code, verify_code
 from app.config import settings
@@ -215,6 +219,67 @@ def login(
     return {"access_token": access_token, "token_type": "bearer"}
 
 
+@router.post("/apple", response_model=Token)
+def login_with_apple(
+    request: AppleLoginRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    try:
+        claims = verify_apple_identity_token(request.identity_token, request.nonce)
+    except AppleTokenError as exc:
+        raise HTTPException(status_code=401, detail="Apple 登录凭证无效") from exc
+
+    subject = str(claims["sub"])
+    identity = db.query(AuthIdentity).filter(
+        AuthIdentity.provider == "apple",
+        AuthIdentity.provider_subject == subject,
+    ).first()
+
+    if identity is not None:
+        user = identity.user
+    else:
+        email = str(claims.get("email") or "").strip().lower()
+        email_verified = claims.get("email_verified") in (True, "true", "True")
+        if not email or not email_verified:
+            raise HTTPException(status_code=400, detail="Apple 未提供已验证邮箱，请重新授权")
+
+        # A verified Apple email can safely attach to the matching local account.
+        user = get_user_by_email(db, email)
+        if user is None:
+            username_base = f"apple_{hashlib.sha256(subject.encode()).hexdigest()[:12]}"
+            username = username_base[:30]
+            suffix = 1
+            while get_user_by_username(db, username):
+                suffix += 1
+                username = f"{username_base[:25]}_{suffix}"
+            user = User(
+                email=email,
+                username=username,
+                username_is_generated=True,
+                password_hash=get_password_hash(secrets.token_urlsafe(32)),
+                display_name=request.full_name.strip() if request.full_name else email.split("@", 1)[0],
+            )
+            db.add(user)
+            db.flush()
+
+        db.add(AuthIdentity(
+            user_id=user.id,
+            provider="apple",
+            provider_subject=subject,
+            email=email,
+        ))
+        db.commit()
+        db.refresh(user)
+
+    access_token = create_access_token(
+        data={"sub": str(user.id)},
+        expires_delta=timedelta(minutes=settings.jwt_expire_minutes),
+    )
+    set_auth_cookie(response, access_token)
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
 @router.post("/logout")
 def logout(response: Response):
     clear_auth_cookie(response)
@@ -235,6 +300,6 @@ def reset_password(request: PasswordReset, db: Session = Depends(get_db)):
     user = get_user_by_email(db, request.email)
     if not user or not verify_code(request.email, request.code, purpose="password_reset"):
         raise HTTPException(status_code=400, detail="验证码错误或已过期")
-    user.password_hash = get_password_hash(request.new_password)
+    set_password(db, user, request.new_password)
     db.commit()
     return {"message": "密码已重置"}

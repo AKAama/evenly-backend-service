@@ -9,6 +9,7 @@ class UserBase(BaseModel):
     username: str
     display_name: str | None = None
     avatar_url: str | None = None
+    username_is_generated: bool = False
 
 
 class UserCreate(UserBase):
@@ -18,6 +19,12 @@ class UserCreate(UserBase):
 class UserLogin(BaseModel):
     identifier: str
     password: str
+
+
+class AppleLoginRequest(BaseModel):
+    identity_token: str
+    nonce: str
+    full_name: str | None = Field(default=None, max_length=100)
 
 
 class UserResponse(UserBase):
@@ -44,6 +51,20 @@ class UserUpdate(BaseModel):
 class PasswordChange(BaseModel):
     old_password: str
     new_password: str
+
+
+class UsernameUpdate(BaseModel):
+    username: str = Field(min_length=3, max_length=30)
+
+
+class PasswordSetup(BaseModel):
+    code: str
+    new_password: str = Field(min_length=6)
+
+
+class AuthMethodsResponse(BaseModel):
+    methods: list[str]
+    has_password: bool
 
 
 class EmailChange(BaseModel):

@@ -3,6 +3,8 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict
 
 from app.schemas.user import UserResponse
+from app.schemas.expense import ExpenseWithDetails
+from app.schemas.settlement import SettlementInstruction, SettlementWithUsers
 
 
 class LedgerMemberResponse(BaseModel):
@@ -77,3 +79,10 @@ class LedgerInvitationResponse(BaseModel):
     ledger_name: str
     invited_by_name: str
     created_at: datetime
+
+
+class LedgerOverviewResponse(BaseModel):
+    ledger: LedgerWithMembers
+    expenses: list[ExpenseWithDetails]
+    settlement_suggestions: list[SettlementInstruction]
+    settlement_history: list[SettlementWithUsers]

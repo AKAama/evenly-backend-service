@@ -1,6 +1,6 @@
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import joinedload, Session
 from typing import List
 
 from app.database import get_db
@@ -56,13 +56,19 @@ def get_settlement_history(
     get_ledger_or_404(db, ledger_id)
     require_ledger_member(db, ledger_id, current_user)
 
-    settlements = db.query(Settlement).filter(Settlement.ledger_id == ledger_id).order_by(Settlement.settled_at.desc()).all()
+    settlements = (
+        db.query(Settlement)
+        .options(
+            joinedload(Settlement.from_user),
+            joinedload(Settlement.to_user),
+        )
+        .filter(Settlement.ledger_id == ledger_id)
+        .order_by(Settlement.settled_at.desc())
+        .all()
+    )
 
     result = []
     for s in settlements:
-        from_user = db.query(User).filter(User.id == s.from_user_id).first()
-        to_user = db.query(User).filter(User.id == s.to_user_id).first()
-
         result.append(SettlementWithUsers(
             id=s.id,
             ledger_id=s.ledger_id,
@@ -71,8 +77,8 @@ def get_settlement_history(
             amount=s.amount,
             note=s.note,
             settled_at=s.settled_at,
-            from_user=UserResponse.model_validate(from_user),
-            to_user=UserResponse.model_validate(to_user),
+            from_user=UserResponse.model_validate(s.from_user),
+            to_user=UserResponse.model_validate(s.to_user),
         ))
 
     return result

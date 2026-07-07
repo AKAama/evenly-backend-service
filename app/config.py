@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     auth_cookie_name: str = "evenly_access_token"
     auth_cookie_secure: bool = False
     auth_cookie_samesite: str = "lax"
+    apple_client_id: str = "com.yhma.Evenly"
+
+    # Request timing. Requests at or above this threshold are tagged as slow.
+    slow_request_threshold_ms: float = 20.0
 
     @property
     def database_url(self) -> str:

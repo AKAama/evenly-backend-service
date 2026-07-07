@@ -1,5 +1,6 @@
 from uuid import UUID
 import logging
+import re
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from sqlalchemy.orm import Session
 from typing import List
@@ -13,11 +14,28 @@ from app.models import (
     ExpenseSplit,
     ExpenseConfirmation,
     Settlement,
+    AuthIdentity,
 )
-from app.schemas.user import UserResponse, UserUpdate, PasswordChange, EmailChange, EmailChangeCodeRequest
+from app.schemas.user import (
+    AuthMethodsResponse,
+    EmailChange,
+    EmailChangeCodeRequest,
+    PasswordChange,
+    PasswordSetup,
+    UsernameUpdate,
+    UserResponse,
+    UserUpdate,
+)
 from app.utils.deps import get_current_user
 from app.services.cos import get_cos_service
-from app.services.auth import verify_password, get_password_hash, get_user_by_email
+from app.services.auth import (
+    change_password_email,
+    get_password_identity,
+    get_user_by_email,
+    set_password,
+    get_user_by_username,
+    verify_password,
+)
 from app.services.verification import send_verification_code, verify_code
 from app.config import settings
 
@@ -28,6 +46,40 @@ logger = logging.getLogger(__name__)
 @router.get("/me", response_model=UserResponse)
 def get_current_user_info(current_user: User = Depends(get_current_user)):
     """Get current user information"""
+    return current_user
+
+
+@router.get("/me/auth-methods", response_model=AuthMethodsResponse)
+def get_auth_methods(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    methods = [
+        provider
+        for (provider,) in db.query(AuthIdentity.provider)
+        .filter(AuthIdentity.user_id == current_user.id)
+        .order_by(AuthIdentity.provider)
+        .all()
+    ]
+    return AuthMethodsResponse(methods=methods, has_password="password" in methods)
+
+
+@router.put("/me/username", response_model=UserResponse)
+def update_username(
+    request: UsernameUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    username = request.username.strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{2,29}", username):
+        raise HTTPException(status_code=400, detail="用户名须为3-30位，以英文字母开头，仅包含英文、数字和下划线")
+    existing = get_user_by_username(db, username)
+    if existing and existing.id != current_user.id:
+        raise HTTPException(status_code=400, detail="用户名已被使用")
+    current_user.username = username
+    current_user.username_is_generated = False
+    db.commit()
+    db.refresh(current_user)
     return current_user
 
 
@@ -146,17 +198,47 @@ def change_password(
 ):
     """Change user password"""
     # Verify old password
-    if not verify_password(password_change.old_password, current_user.password_hash):
+    identity = get_password_identity(db, current_user.id)
+    if not identity or not identity.password_hash or not verify_password(
+        password_change.old_password, identity.password_hash
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Incorrect old password"
         )
 
     # Update password
-    current_user.password_hash = get_password_hash(password_change.new_password)
+    set_password(db, current_user, password_change.new_password)
     db.commit()
 
     return {"message": "Password updated successfully"}
+
+
+@router.post("/me/password/setup/send")
+def send_password_setup_code(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if get_password_identity(db, current_user.id):
+        raise HTTPException(status_code=400, detail="账号已经设置密码")
+    if not send_verification_code(current_user.email, purpose="password_setup"):
+        raise HTTPException(status_code=429, detail="发送过于频繁，请稍后重试")
+    return {"message": "验证码已发送"}
+
+
+@router.put("/me/password/setup")
+def setup_password(
+    request: PasswordSetup,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if get_password_identity(db, current_user.id):
+        raise HTTPException(status_code=400, detail="账号已经设置密码")
+    if not verify_code(current_user.email, request.code, purpose="password_setup"):
+        raise HTTPException(status_code=400, detail="验证码错误或已过期")
+    set_password(db, current_user, request.new_password)
+    db.commit()
+    return {"message": "密码设置成功"}
 
 
 @router.post("/me/email/send-verification")
@@ -182,13 +264,16 @@ def change_email(
     db: Session = Depends(get_db),
 ):
     new_email = str(request.new_email).strip().lower()
-    if not verify_password(request.password, current_user.password_hash):
+    identity = get_password_identity(db, current_user.id)
+    if not identity or not identity.password_hash or not verify_password(
+        request.password, identity.password_hash
+    ):
         raise HTTPException(status_code=400, detail="当前密码错误")
     if get_user_by_email(db, new_email):
         raise HTTPException(status_code=400, detail="该邮箱已被使用")
     if not verify_code(new_email, request.code, purpose="email_change"):
         raise HTTPException(status_code=400, detail="验证码错误或已过期")
-    current_user.email = new_email
+    change_password_email(db, current_user, new_email)
     db.commit()
     db.refresh(current_user)
     return current_user

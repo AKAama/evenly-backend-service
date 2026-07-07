@@ -1,12 +1,22 @@
 import logging
+from decimal import Decimal
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func
+from sqlalchemy.orm import joinedload, Session
 from typing import List
 
 from app.database import get_db
-from app.models import User, Ledger, LedgerMember, Expense, ExpenseSplit, Settlement
+from app.models import (
+    User,
+    Ledger,
+    LedgerMember,
+    Expense,
+    ExpenseConfirmation,
+    ExpenseSplit,
+    ExpenseStatus,
+    Settlement,
+)
 from app.schemas.ledger import (
     LedgerCreate,
     LedgerResponse,
@@ -16,7 +26,14 @@ from app.schemas.ledger import (
     MemberCreate,
     LedgerInvitationResponse,
     LedgerMemberWithUser,
+    LedgerOverviewResponse,
 )
+from app.schemas.expense import (
+    ExpenseConfirmationResponse,
+    ExpenseSplitResponse,
+    ExpenseWithDetails,
+)
+from app.schemas.settlement import SettlementInstruction, SettlementWithUsers
 from app.schemas.user import UserResponse
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 
@@ -259,12 +276,15 @@ def get_ledger(
     require_ledger_member(db, ledger_id, current_user)
 
     # Get members with user details (include pending so owner can see outstanding invitations)
-    members = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-    ).all()
+    members = (
+        db.query(LedgerMember)
+        .options(joinedload(LedgerMember.user))
+        .filter(LedgerMember.ledger_id == ledger_id)
+        .all()
+    )
     member_responses: list[LedgerMemberWithUser] = []
     for m in members:
-        user = db.query(User).filter(User.id == m.user_id).first() if m.user_id and not m.is_temporary else None
+        user = m.user if m.user_id and not m.is_temporary else None
         member_responses.append(LedgerMemberWithUser(
             id=m.id,
             user_id=m.user_id,
@@ -279,6 +299,184 @@ def get_ledger(
     response = LedgerWithMembers.model_validate(ledger)
     response.members = member_responses
     return response
+
+
+@router.get("/{ledger_id}/overview", response_model=LedgerOverviewResponse)
+def get_ledger_overview(
+    ledger_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Load all data required by the main ledger screen in one request."""
+    ledger = (
+        db.query(Ledger)
+        .join(
+            LedgerMember,
+            and_(
+                LedgerMember.ledger_id == Ledger.id,
+                LedgerMember.user_id == current_user.id,
+                LedgerMember.is_temporary.is_(False),
+                LedgerMember.status == "active",
+            ),
+        )
+        .filter(Ledger.id == ledger_id)
+        .first()
+    )
+    if ledger is None:
+        raise HTTPException(status_code=404, detail="Ledger not found")
+
+    members = (
+        db.query(LedgerMember)
+        .options(joinedload(LedgerMember.user))
+        .filter(LedgerMember.ledger_id == ledger_id)
+        .all()
+    )
+    active_members = [member for member in members if member.status == "active"]
+    member_responses = [
+        LedgerMemberWithUser(
+            id=member.id,
+            user_id=member.user_id,
+            nickname=member.nickname,
+            joined_at=member.joined_at,
+            user=UserResponse.model_validate(member.user) if member.user else None,
+            is_temporary=member.is_temporary,
+            temporary_name=member.temporary_name,
+            status=member.status,
+        )
+        for member in members
+    ]
+
+    expenses = (
+        db.query(Expense)
+        .options(
+            joinedload(Expense.payer),
+            joinedload(Expense.splits),
+            joinedload(Expense.confirmations),
+        )
+        .filter(Expense.ledger_id == ledger_id)
+        .order_by(Expense.created_at.desc())
+        .all()
+    )
+    expense_responses = []
+    for expense in expenses:
+        effective_status = expense.status
+        if effective_status == ExpenseStatus.PENDING:
+            required_ids = {
+                split.user_id for split in expense.splits if split.user_id is not None
+            } - {expense.created_by}
+            confirmed_ids = {
+                confirmation.user_id
+                for confirmation in expense.confirmations
+                if confirmation.status == "confirmed"
+            }
+            if required_ids <= confirmed_ids:
+                effective_status = ExpenseStatus.CONFIRMED
+
+        expense_responses.append(ExpenseWithDetails(
+            id=expense.id,
+            ledger_id=expense.ledger_id,
+            payer_id=expense.payer_id,
+            created_by=expense.created_by,
+            title=expense.title,
+            total_amount=expense.total_amount,
+            note=expense.note,
+            expense_date=expense.expense_date,
+            status=effective_status.value,
+            created_at=expense.created_at,
+            updated_at=expense.updated_at,
+            payer=UserResponse.model_validate(expense.payer),
+            splits=[ExpenseSplitResponse.model_validate(split) for split in expense.splits],
+            confirmations=[
+                ExpenseConfirmationResponse.model_validate(confirmation)
+                for confirmation in expense.confirmations
+            ],
+        ))
+
+    settlement_rows = (
+        db.query(Settlement)
+        .options(joinedload(Settlement.from_user), joinedload(Settlement.to_user))
+        .filter(Settlement.ledger_id == ledger_id)
+        .order_by(Settlement.settled_at.desc())
+        .all()
+    )
+    history = [
+        SettlementWithUsers(
+            id=row.id,
+            ledger_id=row.ledger_id,
+            from_user_id=row.from_user_id,
+            to_user_id=row.to_user_id,
+            amount=row.amount,
+            note=row.note,
+            settled_at=row.settled_at,
+            from_user=UserResponse.model_validate(row.from_user),
+            to_user=UserResponse.model_validate(row.to_user),
+        )
+        for row in settlement_rows
+    ]
+
+    registered_members = [member for member in active_members if member.user_id is not None]
+    balances = {member.user_id: Decimal("0") for member in registered_members}
+    names = {
+        member.user_id: (
+            member.user.display_name or member.user.email
+            if member.user else member.nickname or "Unknown"
+        )
+        for member in registered_members
+    }
+    for expense in expenses:
+        if expense.status == ExpenseStatus.REJECTED:
+            continue
+        if expense.payer_id in balances:
+            balances[expense.payer_id] += expense.total_amount
+        for split in expense.splits:
+            if split.user_id in balances:
+                balances[split.user_id] -= split.amount
+    for row in settlement_rows:
+        if row.from_user_id in balances:
+            balances[row.from_user_id] += row.amount
+        if row.to_user_id in balances:
+            balances[row.to_user_id] -= row.amount
+
+    creditors = sorted(
+        [(user_id, amount) for user_id, amount in balances.items() if amount > 0],
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    debtors = sorted(
+        [(user_id, -amount) for user_id, amount in balances.items() if amount < 0],
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    suggestions = []
+    creditor_index = debtor_index = 0
+    while creditor_index < len(creditors) and debtor_index < len(debtors):
+        creditor_id, credit = creditors[creditor_index]
+        debtor_id, debt = debtors[debtor_index]
+        amount = min(credit, debt)
+        suggestions.append(SettlementInstruction(
+            from_user_id=debtor_id,
+            from_user_name=names.get(debtor_id, "Unknown"),
+            to_user_id=creditor_id,
+            to_user_name=names.get(creditor_id, "Unknown"),
+            amount=amount,
+        ))
+        creditors[creditor_index] = (creditor_id, credit - amount)
+        debtors[debtor_index] = (debtor_id, debt - amount)
+        if creditors[creditor_index][1] <= 0:
+            creditor_index += 1
+        if debtors[debtor_index][1] <= 0:
+            debtor_index += 1
+
+    ledger_response = LedgerWithMembers.model_validate(ledger)
+    ledger_response.members = member_responses
+    ledger_response.member_count = len(active_members)
+    ledger_response.expense_count = len(expenses)
+    return LedgerOverviewResponse(
+        ledger=ledger_response,
+        expenses=expense_responses,
+        settlement_suggestions=suggestions,
+        settlement_history=history,
+    )
 
 
 @router.delete("/{ledger_id}", status_code=status.HTTP_204_NO_CONTENT)

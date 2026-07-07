@@ -1,7 +1,7 @@
 from uuid import UUID
 from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import joinedload, selectinload, Session
 from typing import List
 
 from app.database import get_db
@@ -146,13 +146,23 @@ def get_expenses(
     # Check if user is a member
     require_ledger_member(db, ledger_id, current_user)
 
-    expenses = db.query(Expense).filter(Expense.ledger_id == ledger_id).order_by(Expense.created_at.desc()).all()
+    expenses = (
+        db.query(Expense)
+        .options(
+            joinedload(Expense.payer),
+            selectinload(Expense.splits),
+            selectinload(Expense.confirmations),
+        )
+        .filter(Expense.ledger_id == ledger_id)
+        .order_by(Expense.created_at.desc())
+        .all()
+    )
 
     result = []
     for exp in expenses:
-        payer = db.query(User).filter(User.id == exp.payer_id).first()
-        splits = db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == exp.id).all()
-        confirmations = db.query(ExpenseConfirmation).filter(ExpenseConfirmation.expense_id == exp.id).all()
+        payer = exp.payer
+        splits = exp.splits
+        confirmations = exp.confirmations
         if exp.status == ExpenseStatus.PENDING:
             required_ids = {s.user_id for s in splits if s.user_id is not None} - {exp.created_by}
             confirmed_ids = {c.user_id for c in confirmations if c.status == "confirmed"}

@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime
+from sqlalchemy import Boolean, Column, String, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -13,6 +13,7 @@ class User(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String(255), unique=True, nullable=False, index=True)
     username = Column(String(30), nullable=False, index=True)
+    username_is_generated = Column(Boolean, nullable=False, default=False)
     password_hash = Column(String, nullable=False)
     display_name = Column(String(100))
     avatar_url = Column(String)
@@ -33,3 +34,36 @@ class User(Base):
     settlements_to = relationship("Settlement", back_populates="to_user", foreign_keys="Settlement.to_user_id")
     expense_splits = relationship("ExpenseSplit", back_populates="user")
     expense_confirmations = relationship("ExpenseConfirmation", back_populates="user")
+    auth_identities = relationship(
+        "AuthIdentity",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+
+class AuthIdentity(Base):
+    __tablename__ = "auth_identities"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "provider_subject",
+            name="uq_auth_identity_provider_subject",
+        ),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider = Column(String(20), nullable=False)
+    provider_subject = Column(String(255), nullable=False)
+    email = Column(String(255), nullable=True)
+    phone = Column(String(32), nullable=True)
+    password_hash = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="auth_identities")
