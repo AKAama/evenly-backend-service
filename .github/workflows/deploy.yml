@@ -20,7 +20,10 @@ jobs:
 
       - name: Read version
         id: ver
-        run: echo "tag=$(cat .version)" >> "$GITHUB_OUTPUT"
+        run: |
+          VERSION=$(cat .version)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=${VERSION}-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       - name: Login to Aliyun ACR
         uses: docker/login-action@v3
@@ -47,6 +50,14 @@ jobs:
             set -e
             IMAGE=crpi-3xux8vqn35fw00z9.cn-shanghai.personal.cr.aliyuncs.com/project_hub/evenly-backend-service:${{ steps.ver.outputs.tag }}
             docker pull "$IMAGE"
+
+            # Verify that the new image understands the database's current
+            # revision, then migrate before replacing the live container.
+            docker run --rm \
+              -v /opt/evenly-backend-service/config/config.yaml:/app/config/config.yaml:ro \
+              "$IMAGE" \
+              sh -c 'cd /app && python -m alembic current && python -m alembic upgrade head'
+
             docker stop evenly-backend-service || true
             docker rm evenly-backend-service || true
             docker run -d --name evenly-backend-service --restart unless-stopped \
@@ -54,6 +65,5 @@ jobs:
               -v /opt/evenly-backend-service/config/config.yaml:/app/config/config.yaml:ro \
               "$IMAGE"
             sleep 4
-            docker exec evenly-backend-service sh -c 'cd /app && python -m alembic upgrade head'
-            curl -sf -o /dev/null http://127.0.0.1:8000/docs
+            curl -sf -o /dev/null http://127.0.0.1:8000/ready
             echo "deploy ok"
