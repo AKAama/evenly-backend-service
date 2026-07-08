@@ -39,6 +39,15 @@ make dev-api
 
 The API listens on `http://localhost:8000`.
 
+To enable voice expense drafts, keep the OpenAI key on the backend:
+
+```bash
+export OPENAI_API_KEY="your-key"
+```
+
+The default transcription and text models can be overridden with
+`OPENAI_TRANSCRIPTION_MODEL` and `OPENAI_TEXT_MODEL`.
+
 ## Check common startup issues
 
 If business endpoints return `500 Internal Server Error`, check the database

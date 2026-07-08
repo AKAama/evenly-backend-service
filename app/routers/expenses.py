@@ -1,6 +1,6 @@
 from uuid import UUID
 from decimal import Decimal
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import joinedload, selectinload, Session
 from typing import List
 
@@ -13,8 +13,10 @@ from app.schemas.expense import (
     ConfirmExpenseRequest,
     ExpenseSplitResponse,
     ExpenseConfirmationResponse,
+    VoiceExpenseDraft,
 )
 from app.schemas.user import UserResponse
+from app.services.voice_expense import VoiceExpenseError, create_voice_expense_draft
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
@@ -24,6 +26,56 @@ CENT = Decimal("0.01")
 
 def normalize_money(value: Decimal) -> Decimal:
     return value.quantize(CENT)
+
+
+@router.post("/ledgers/{ledger_id}/voice-draft", response_model=VoiceExpenseDraft)
+def create_voice_draft(
+    ledger_id: UUID,
+    audio: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Transcribe audio and return a validated expense draft without saving it."""
+    get_ledger_or_404(db, ledger_id)
+    require_ledger_member(db, ledger_id, current_user)
+    content_type = audio.content_type or "application/octet-stream"
+    if not content_type.startswith("audio/"):
+        raise HTTPException(status_code=400, detail="请上传音频文件")
+
+    audio_bytes = audio.file.read(10 * 1024 * 1024 + 1)
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="音频文件为空")
+    if len(audio_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="音频文件不能超过 10 MB")
+
+    rows = (
+        db.query(LedgerMember)
+        .filter(
+            LedgerMember.ledger_id == ledger_id,
+            LedgerMember.status == "active",
+        )
+        .all()
+    )
+    members = [
+        {
+            "member_id": str(member.id),
+            "user_id": str(member.user_id) if member.user_id else None,
+            "name": member.display_name,
+            "registered": member.user_id is not None,
+        }
+        for member in rows
+    ]
+    try:
+        return create_voice_expense_draft(
+            audio=audio_bytes,
+            filename=audio.filename or "voice.m4a",
+            content_type=content_type,
+            members=members,
+            current_user_id=str(current_user.id),
+        )
+    except VoiceExpenseError as exc:
+        status_code = 503 if "OPENAI_API_KEY" in str(exc) else 502
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 @router.post("/ledgers/{ledger_id}/expenses", response_model=ExpenseResponse, status_code=status.HTTP_201_CREATED)
@@ -300,7 +352,7 @@ def delete_expense(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Delete an expense (only creator, and only if pending)"""
+    """Delete an expense (creator or ledger owner)."""
     expense = db.query(Expense).filter(Expense.id == expense_id).first()
     if not expense:
         raise HTTPException(status_code=404, detail="Expense not found")
@@ -308,11 +360,12 @@ def delete_expense(
     # Defensive: caller must be an active member of the ledger this expense belongs to
     require_ledger_member(db, expense.ledger_id, current_user)
 
-    if expense.created_by != current_user.id:
-        raise HTTPException(status_code=403, detail="Only creator can delete this expense")
-
-    if expense.status != ExpenseStatus.PENDING:
-        raise HTTPException(status_code=400, detail="Can only delete pending expenses")
+    ledger = get_ledger_or_404(db, expense.ledger_id)
+    if expense.created_by != current_user.id and ledger.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the expense creator or ledger owner can delete this expense",
+        )
 
     db.delete(expense)
     db.commit()

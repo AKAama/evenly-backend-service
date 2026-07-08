@@ -59,7 +59,7 @@ def require_ledger_member(db: Session, ledger_id, current_user: User) -> LedgerM
     membership = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger_id,
         LedgerMember.user_id == current_user.id,
-        LedgerMember.is_temporary.is_(False),
+        LedgerMember.user_id.is_not(None),
         LedgerMember.status == "active",
     ).first()
 

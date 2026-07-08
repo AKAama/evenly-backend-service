@@ -70,3 +70,12 @@ class ExpenseWithDetails(ExpenseResponse):
 
 class ConfirmExpenseRequest(BaseModel):
     status: str  # 'confirmed' or 'rejected'
+
+
+class VoiceExpenseDraft(BaseModel):
+    transcript: str
+    title: str
+    amount: Decimal
+    payer_user_id: UUID
+    participant_member_ids: list[UUID]
+    confirmation_text: str

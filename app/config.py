@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     auth_cookie_samesite: str = "lax"
     apple_client_id: str = "com.yhma.Evenly"
 
+    # OpenAI-backed voice expense drafts. The key is server-side only.
+    openai_api_key: Optional[str] = Field(default=None, validation_alias="OPENAI_API_KEY")
+    openai_transcription_model: str = "gpt-4o-mini-transcribe"
+    openai_text_model: str = "gpt-4o-mini"
+
     # Request timing. Requests at or above this threshold are tagged as slow.
     slow_request_threshold_ms: float = 20.0
 

@@ -24,7 +24,7 @@ from app.models import (
     Settlement,
     User,
 )
-from app.routers.expenses import confirm_expense, create_expense
+from app.routers.expenses import confirm_expense, create_expense, delete_expense
 from app.routers.ledgers import accept_invitation, create_ledger, get_ledger, get_ledgers, remove_member
 from app.routers import users as users_router
 from app.schemas.ledger import LedgerCreate, MemberCreate
@@ -33,6 +33,7 @@ from app.schemas.expense import ConfirmExpenseRequest, ExpenseCreate, ExpenseSpl
 from app.schemas.settlement import SettlementCreate
 from app.services import verification
 from app.services.auth import get_password_hash
+from app.services.voice_expense import create_voice_expense_draft
 from main import app
 
 
@@ -108,22 +109,108 @@ def make_ledger(db, owner, *, with_temp_member=False):
     db.commit()
     db.refresh(ledger)
 
-    db.add(LedgerMember(ledger_id=ledger.id, user_id=owner.id, nickname=owner.display_name))
+    db.add(LedgerMember(ledger_id=ledger.id, user_id=owner.id, display_name=owner.display_name))
     if with_temp_member:
         db.add(LedgerMember(
             ledger_id=ledger.id,
             user_id=None,
-            nickname="Temporary",
-            is_temporary=True,
-            temporary_name="Temporary",
+            display_name="Temporary",
         ))
     db.commit()
     return ledger
 
 
 def add_member(db, ledger, user):
-    db.add(LedgerMember(ledger_id=ledger.id, user_id=user.id, nickname=user.display_name))
+    db.add(LedgerMember(ledger_id=ledger.id, user_id=user.id, display_name=user.display_name))
     db.commit()
+
+
+def test_voice_expense_draft_endpoint_returns_ai_draft(db, client, monkeypatch):
+    owner = make_login_user(db, "voice-owner@example.com", "Owner")
+    friend = make_user(db, "voice-friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+    memberships = db.query(LedgerMember).filter_by(ledger_id=ledger.id).all()
+    owner_member = next(item for item in memberships if item.user_id == owner.id)
+
+    def fake_create_voice_expense_draft(**kwargs):
+        assert kwargs["audio"] == b"recording"
+        assert {item["name"] for item in kwargs["members"]} == {"Owner", "Friend"}
+        return {
+            "transcript": "午饭 88 元，我付，和 Friend 一起",
+            "title": "午饭",
+            "amount": Decimal("88.00"),
+            "payer_user_id": str(owner.id),
+            "participant_member_ids": [str(owner_member.id)],
+            "confirmation_text": "已生成午饭，请确认。",
+        }
+
+    monkeypatch.setattr(
+        "app.routers.expenses.create_voice_expense_draft",
+        fake_create_voice_expense_draft,
+    )
+    assert client.post(
+        "/auth/login",
+        data={"username": owner.email, "password": "secret123"},
+    ).status_code == 200
+
+    response = client.post(
+        f"/expenses/ledgers/{ledger.id}/voice-draft",
+        files={"audio": ("voice.m4a", b"recording", "audio/mp4")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["amount"] == "88.00"
+    assert response.json()["participant_member_ids"] == [str(owner_member.id)]
+
+
+def test_voice_expense_draft_filters_unknown_and_duplicate_members(monkeypatch):
+    owner_id = str(uuid.uuid4())
+    owner_member_id = str(uuid.uuid4())
+    friend_member_id = str(uuid.uuid4())
+    unknown_member_id = str(uuid.uuid4())
+    members = [
+        {
+            "member_id": owner_member_id,
+            "user_id": owner_id,
+            "name": "Owner",
+            "registered": True,
+        },
+        {
+            "member_id": friend_member_id,
+            "user_id": None,
+            "name": "Friend",
+            "registered": False,
+        },
+    ]
+    monkeypatch.setattr(
+        "app.services.voice_expense.transcribe_audio",
+        lambda *_: "午饭 88 元",
+    )
+    monkeypatch.setattr(
+        "app.services.voice_expense.parse_expense_draft",
+        lambda *_: {
+            "title": "午饭",
+            "amount": 88,
+            "payer_user_id": "not-a-ledger-user",
+            "participant_member_ids": [
+                friend_member_id,
+                friend_member_id,
+                unknown_member_id,
+            ],
+        },
+    )
+
+    draft = create_voice_expense_draft(
+        audio=b"recording",
+        filename="voice.m4a",
+        content_type="audio/mp4",
+        members=members,
+        current_user_id=owner_id,
+    )
+
+    assert draft["payer_user_id"] == owner_id
+    assert draft["participant_member_ids"] == [friend_member_id, owner_member_id]
 
 
 def assert_http_error(exc_info, status_code):
@@ -188,7 +275,7 @@ def test_ledger_summary_counts_members_and_expenses(db):
     ledger = make_ledger(db, owner, with_temp_member=True)
     add_member(db, ledger, friend)
 
-    create_expense(
+    expense = create_expense(
         ledger.id,
         ExpenseCreate(
             title="Lunch",
@@ -329,7 +416,7 @@ def test_create_expense_allows_temporary_member_split(db):
     ).one()
     temporary_member = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger.id,
-        LedgerMember.is_temporary.is_(True),
+            LedgerMember.user_id.is_(None),
     ).one()
 
     created = create_expense(
@@ -459,8 +546,7 @@ def test_settlement_rejects_same_user_and_non_positive_amount(db):
     assert_http_error(exc_info, 400)
 
 
-def test_recorded_settlement_reduces_remaining_settlement_amount(db):
-    """Recording a partial settlement reduces the remaining suggested amount."""
+def test_transfer_flow_appears_only_after_every_participant_confirms(db):
     owner = make_user(db, "owner@example.com", "Owner")
     friend = make_user(db, "friend@example.com", "Friend")
     ledger = make_ledger(db, owner)
@@ -477,6 +563,9 @@ def test_recorded_settlement_reduces_remaining_settlement_amount(db):
         ],
     )
     expense = create_expense(ledger.id, payload, db=db, current_user=owner)
+
+    assert get_settlements(ledger.id, db=db, current_user=owner) == []
+
     confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=friend)
 
     suggestions = get_settlements(ledger.id, db=db, current_user=owner)
@@ -485,7 +574,32 @@ def test_recorded_settlement_reduces_remaining_settlement_amount(db):
     assert suggestions[0].to_user_id == owner.id
     assert suggestions[0].amount == Decimal("5.00")
 
-    # Partial payment of 2 -> remaining should be 3
+
+def test_recorded_settlement_does_not_change_generated_transfer_flow(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+
+    expense = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Dinner",
+            total_amount=Decimal("10.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("5.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("5.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=friend)
+
+    # Legacy transfer records may remain in the database, but no longer affect
+    # the flow generated from confirmed expenses.
     create_settlement(
         ledger.id,
         SettlementCreate(
@@ -496,23 +610,14 @@ def test_recorded_settlement_reduces_remaining_settlement_amount(db):
         db=db,
         current_user=owner,
     )
-
     suggestions = get_settlements(ledger.id, db=db, current_user=owner)
     assert len(suggestions) == 1
     assert suggestions[0].from_user_id == friend.id
     assert suggestions[0].to_user_id == owner.id
-    assert suggestions[0].amount == Decimal("3.00")
+    assert suggestions[0].amount == Decimal("5.00")
 
 
-def test_full_settlement_clears_suggestions_and_new_expense_only_counts_new_debt(db):
-    """After a bill is fully settled, a new expense must not double-count the old one.
-
-    Scenario (the reported bug):
-      1. A pays 100 for dinner, B owes A 50.
-      2. B pays A 50 via settlement; the ledger is balanced.
-      3. A pays another 60 for lunch, B owes A 30.
-      4. The suggestion should be B->A 30, NOT B->A 80.
-    """
+def test_transfer_flow_accumulates_all_confirmed_expenses(db):
     owner = make_user(db, "owner@example.com", "Owner")
     friend = make_user(db, "friend@example.com", "Friend")
     ledger = make_ledger(db, owner)
@@ -546,8 +651,8 @@ def test_full_settlement_clears_suggestions_and_new_expense_only_counts_new_debt
         current_user=owner,
     )
 
-    # Everything should be settled now
-    assert get_settlements(ledger.id, db=db, current_user=owner) == []
+    # Transfer records do not clear or acknowledge the generated flow.
+    assert get_settlements(ledger.id, db=db, current_user=owner)[0].amount == Decimal("50.00")
 
     # Second expense: owner pays 60, split 30/30
     lunch = create_expense(
@@ -571,11 +676,10 @@ def test_full_settlement_clears_suggestions_and_new_expense_only_counts_new_debt
     assert len(suggestions) == 1
     assert suggestions[0].from_user_id == friend.id
     assert suggestions[0].to_user_id == owner.id
-    # Bug would have produced 50 + 30 = 80; correct answer is 30
-    assert suggestions[0].amount == Decimal("30.00")
+    assert suggestions[0].amount == Decimal("80.00")
 
 
-def test_cannot_remove_member_with_expense_history(db):
+def test_cannot_remove_member_with_unsettled_balance(db):
     owner = make_user(db, "owner@example.com", "Owner")
     friend = make_user(db, "friend@example.com", "Friend")
     ledger = make_ledger(db, owner)
@@ -599,12 +703,124 @@ def test_cannot_remove_member_with_expense_history(db):
     assert_http_error(exc_info, 400)
 
 
+def test_can_remove_settled_member_and_preserve_history(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+    membership = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == ledger.id,
+        LedgerMember.user_id == friend.id,
+    ).one()
+
+    expense = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Taxi",
+            total_amount=Decimal("8.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("4.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("4.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+    confirm_expense(
+        expense.id,
+        ConfirmExpenseRequest(status="confirmed"),
+        db=db,
+        current_user=friend,
+    )
+    create_settlement(
+        ledger.id,
+        SettlementCreate(
+            from_user_id=friend.id,
+            to_user_id=owner.id,
+            amount=Decimal("4.00"),
+        ),
+        db=db,
+        current_user=owner,
+    )
+
+    remove_member(ledger.id, friend.id, db=db, current_user=owner)
+
+    db.refresh(membership)
+    assert membership.status == "removed"
+    assert db.query(Expense).filter(Expense.id == expense.id).first() is not None
+
+
+def test_owner_can_delete_another_members_confirmed_expense(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+
+    expense = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Lunch",
+            total_amount=Decimal("12.00"),
+            expense_date=date.today(),
+            payer_id=friend.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("6.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("6.00")),
+            ],
+        ),
+        db=db,
+        current_user=friend,
+    )
+    confirm_expense(
+        expense.id,
+        ConfirmExpenseRequest(status="confirmed"),
+        db=db,
+        current_user=owner,
+    )
+
+    delete_expense(expense.id, db=db, current_user=owner)
+
+    assert db.query(Expense).filter(Expense.id == expense.id).first() is None
+
+
+def test_unrelated_member_cannot_delete_expense(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    creator = make_user(db, "creator@example.com", "Creator")
+    observer = make_user(db, "observer@example.com", "Observer")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, creator)
+    add_member(db, ledger, observer)
+
+    expense = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Coffee",
+            total_amount=Decimal("9.00"),
+            expense_date=date.today(),
+            payer_id=creator.id,
+            splits=[
+                ExpenseSplitCreate(user_id=creator.id, amount=Decimal("9.00")),
+            ],
+        ),
+        db=db,
+        current_user=creator,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        delete_expense(expense.id, db=db, current_user=observer)
+
+    assert_http_error(exc_info, 403)
+    assert db.query(Expense).filter(Expense.id == expense.id).first() is not None
+
+
 def test_owner_can_remove_temporary_member_by_member_id(db):
     owner = make_user(db, "owner@example.com", "Owner")
     ledger = make_ledger(db, owner, with_temp_member=True)
     temp_member = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger.id,
-        LedgerMember.is_temporary == True,
+        LedgerMember.user_id.is_(None),
     ).first()
 
     remove_member(ledger.id, temp_member.id, db=db, current_user=owner)
@@ -619,7 +835,7 @@ def test_non_owner_cannot_remove_temporary_member_by_member_id(db):
     add_member(db, ledger, friend)
     temp_member = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger.id,
-        LedgerMember.is_temporary == True,
+        LedgerMember.user_id.is_(None),
     ).first()
 
     with pytest.raises(HTTPException) as exc_info:
@@ -726,6 +942,114 @@ def test_ledger_overview_returns_main_screen_payload(db, client):
     assert payload["expenses"] == []
     assert payload["settlement_suggestions"] == []
     assert payload["settlement_history"] == []
+
+
+def test_two_user_collaboration_flow_through_api(db, client):
+    owner = make_login_user(db, "cwq@example.com", "cwq")
+    friend = make_login_user(db, "stella@example.com", "Stella")
+
+    owner_client = client
+    friend_client = TestClient(app)
+    try:
+        assert owner_client.post(
+            "/auth/login",
+            data={"username": owner.email, "password": "secret123"},
+        ).status_code == 200
+        assert friend_client.post(
+            "/auth/login",
+            data={"username": friend.email, "password": "secret123"},
+        ).status_code == 200
+
+        create_response = owner_client.post(
+            "/ledgers",
+            json={"name": "cwq and Stella", "currency": "CNY", "members": []},
+        )
+        assert create_response.status_code == 201
+        ledger_id = create_response.json()["id"]
+
+        invite_response = owner_client.post(
+            f"/ledgers/{ledger_id}/members",
+            json={
+                "user_id": str(friend.id),
+                "nickname": "Stella",
+                "is_temporary": False,
+            },
+        )
+        assert invite_response.status_code == 201
+        assert invite_response.json()["status"] == "pending"
+
+        invitations_response = friend_client.get("/ledgers/invitations/pending")
+        assert invitations_response.status_code == 200
+        invitations = invitations_response.json()
+        assert len(invitations) == 1
+        assert invitations[0]["invited_by_name"] == "cwq"
+
+        invitation_id = invitations[0]["id"]
+        assert friend_client.post(
+            f"/ledgers/invitations/{invitation_id}/accept"
+        ).status_code == 204
+
+        for session in (owner_client, friend_client):
+            ledgers_response = session.get("/ledgers")
+            assert ledgers_response.status_code == 200
+            assert [row["id"] for row in ledgers_response.json()] == [ledger_id]
+
+            detail_response = session.get(f"/ledgers/{ledger_id}")
+            assert detail_response.status_code == 200
+            members = detail_response.json()["members"]
+            assert {member["user_id"] for member in members} == {
+                str(owner.id),
+                str(friend.id),
+            }
+            assert {member["status"] for member in members} == {"active"}
+
+        expense_response = owner_client.post(
+            f"/expenses/ledgers/{ledger_id}/expenses",
+            json={
+                "title": "Dinner",
+                "total_amount": "100.00",
+                "expense_date": date.today().isoformat(),
+                "payer_id": str(owner.id),
+                "splits": [
+                    {"user_id": str(owner.id), "amount": "50.00"},
+                    {"user_id": str(friend.id), "amount": "50.00"},
+                ],
+            },
+        )
+        assert expense_response.status_code == 201
+        expense_id = expense_response.json()["id"]
+
+        pending_overview = friend_client.get(f"/ledgers/{ledger_id}/overview")
+        assert pending_overview.status_code == 200
+        assert pending_overview.json()["settlement_suggestions"] == []
+
+        confirm_response = friend_client.post(
+            f"/expenses/{expense_id}/confirm",
+            json={"status": "confirmed"},
+        )
+        assert confirm_response.status_code == 200
+
+        for session in (owner_client, friend_client):
+            overview_response = session.get(f"/ledgers/{ledger_id}/overview")
+            assert overview_response.status_code == 200
+            overview = overview_response.json()
+            assert len(overview["ledger"]["members"]) == 2
+            assert overview["expenses"][0]["status"] == "confirmed"
+            assert overview["settlement_suggestions"] == [{
+                "from_user_id": str(friend.id),
+                "from_user_name": "Stella",
+                "to_user_id": str(owner.id),
+                "to_user_name": "cwq",
+                "amount": "50.00",
+            }]
+
+        delete_response = owner_client.delete(f"/expenses/{expense_id}")
+        assert delete_response.status_code == 204
+        final_overview = friend_client.get(f"/ledgers/{ledger_id}/overview").json()
+        assert final_overview["expenses"] == []
+        assert final_overview["settlement_suggestions"] == []
+    finally:
+        friend_client.close()
 
 
 def test_login_accepts_case_insensitive_username(db, client):
@@ -841,8 +1165,8 @@ def test_get_ledger_returns_pending_members_with_status(db):
     ledger = make_ledger(db, owner)
     # Simulate an invited-but-not-yet-accepted member
     db.add(LedgerMember(
-        ledger_id=ledger.id, user_id=friend.id, nickname=friend.display_name,
-        status="pending", invited_by=owner.id,
+        ledger_id=ledger.id, user_id=friend.id, display_name=friend.display_name,
+        status="pending",
     ))
     db.commit()
 
@@ -873,13 +1197,13 @@ def test_settlement_excludes_pending_members(db):
     add_member(db, ledger, friend)  # active (via helper which inserts active)
     # outsider is invited but hasn't accepted
     db.add(LedgerMember(
-        ledger_id=ledger.id, user_id=outsider.id, nickname=outsider.display_name,
-        status="pending", invited_by=owner.id,
+        ledger_id=ledger.id, user_id=outsider.id, display_name=outsider.display_name,
+        status="pending",
     ))
     db.commit()
 
     # Owner pays 60, split owner/friend 30/30. Outsider is pending, should NOT be part of anything.
-    create_expense(
+    expense = create_expense(
         ledger.id,
         ExpenseCreate(
             title="Lunch",
@@ -893,6 +1217,12 @@ def test_settlement_excludes_pending_members(db):
         ),
         db=db,
         current_user=owner,
+    )
+    confirm_expense(
+        expense.id,
+        ConfirmExpenseRequest(status="confirmed"),
+        db=db,
+        current_user=friend,
     )
 
     suggestions = get_settlements(ledger.id, db=db, current_user=owner)

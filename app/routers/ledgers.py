@@ -2,7 +2,7 @@ import logging
 from decimal import Decimal
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import and_, func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import joinedload, Session
 from typing import List
 
@@ -33,7 +33,7 @@ from app.schemas.expense import (
     ExpenseSplitResponse,
     ExpenseWithDetails,
 )
-from app.schemas.settlement import SettlementInstruction, SettlementWithUsers
+from app.schemas.settlement import SettlementInstruction
 from app.schemas.user import UserResponse
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 
@@ -112,7 +112,6 @@ def create_ledger(
                 user_id=member_data.user_id,
                 nickname=member_data.nickname or user.display_name,
                 status="pending",
-                invited_by=current_user.id,
             )
         
         db.add(member)
@@ -212,7 +211,7 @@ def get_pending_invitations(
     rows = (
         db.query(LedgerMember, Ledger, User)
         .join(Ledger, Ledger.id == LedgerMember.ledger_id)
-        .join(User, User.id == LedgerMember.invited_by)
+        .join(User, User.id == Ledger.owner_id)
         .filter(
             LedgerMember.user_id == current_user.id,
             LedgerMember.status == "pending",
@@ -225,7 +224,7 @@ def get_pending_invitations(
             ledger_id=ledger.id,
             ledger_name=ledger.name,
             invited_by_name=inviter.display_name,
-            created_at=membership.joined_at,
+            created_at=membership.created_at,
         )
         for membership, ledger, inviter in rows
     ]
@@ -315,7 +314,7 @@ def get_ledger_overview(
             and_(
                 LedgerMember.ledger_id == Ledger.id,
                 LedgerMember.user_id == current_user.id,
-                LedgerMember.is_temporary.is_(False),
+                LedgerMember.user_id.is_not(None),
                 LedgerMember.status == "active",
             ),
         )
@@ -392,27 +391,7 @@ def get_ledger_overview(
             ],
         ))
 
-    settlement_rows = (
-        db.query(Settlement)
-        .options(joinedload(Settlement.from_user), joinedload(Settlement.to_user))
-        .filter(Settlement.ledger_id == ledger_id)
-        .order_by(Settlement.settled_at.desc())
-        .all()
-    )
-    history = [
-        SettlementWithUsers(
-            id=row.id,
-            ledger_id=row.ledger_id,
-            from_user_id=row.from_user_id,
-            to_user_id=row.to_user_id,
-            amount=row.amount,
-            note=row.note,
-            settled_at=row.settled_at,
-            from_user=UserResponse.model_validate(row.from_user),
-            to_user=UserResponse.model_validate(row.to_user),
-        )
-        for row in settlement_rows
-    ]
+    history = []
 
     registered_members = [member for member in active_members if member.user_id is not None]
     balances = {member.user_id: Decimal("0") for member in registered_members}
@@ -424,19 +403,13 @@ def get_ledger_overview(
         for member in registered_members
     }
     for expense in expenses:
-        if expense.status == ExpenseStatus.REJECTED:
+        if expense.status != ExpenseStatus.CONFIRMED:
             continue
         if expense.payer_id in balances:
             balances[expense.payer_id] += expense.total_amount
         for split in expense.splits:
             if split.user_id in balances:
                 balances[split.user_id] -= split.amount
-    for row in settlement_rows:
-        if row.from_user_id in balances:
-            balances[row.from_user_id] += row.amount
-        if row.to_user_id in balances:
-            balances[row.to_user_id] -= row.amount
-
     creditors = sorted(
         [(user_id, amount) for user_id, amount in balances.items() if amount > 0],
         key=lambda item: item[1],
@@ -534,9 +507,25 @@ def add_member(
         # Check if temporary member already exists
         existing = db.query(LedgerMember).filter(
             LedgerMember.ledger_id == ledger_id,
-            LedgerMember.is_temporary == True,
-            LedgerMember.temporary_name == request.temporary_name
+            LedgerMember.user_id.is_(None),
+            LedgerMember.display_name == request.temporary_name,
         ).first()
+
+        if existing and existing.status == "removed":
+            existing.status = "active"
+            existing.nickname = request.temporary_name
+            db.commit()
+            db.refresh(existing)
+            return MemberResponse(
+                id=existing.id,
+                user_id=existing.user_id,
+                nickname=existing.nickname,
+                joined_at=existing.joined_at,
+                user=None,
+                is_temporary=True,
+                temporary_name=existing.temporary_name,
+                status=existing.status,
+            )
 
         if existing:
             logger.info(
@@ -583,9 +572,24 @@ def add_member(
     existing = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger_id
     ).filter(
-        (LedgerMember.user_id == request.user_id) | 
-        ((LedgerMember.is_temporary == True) & (LedgerMember.temporary_name == request.nickname))
+        LedgerMember.user_id == request.user_id
     ).first()
+
+    if existing and existing.status == "removed":
+        existing.status = "pending"
+        existing.nickname = request.nickname or user.display_name
+        db.commit()
+        db.refresh(existing)
+        return MemberResponse(
+            id=existing.id,
+            user_id=existing.user_id,
+            nickname=existing.nickname,
+            joined_at=existing.joined_at,
+            user=UserResponse.model_validate(user),
+            is_temporary=False,
+            temporary_name=None,
+            status=existing.status,
+        )
 
     if existing:
         logger.info("Duplicate regular member add rejected ledger_id=%s user_id=%s", ledger_id, request.user_id)
@@ -597,7 +601,6 @@ def add_member(
         user_id=request.user_id,
         nickname=request.nickname or user.display_name,
         status="pending",
-        invited_by=current_user.id,
     )
     db.add(member)
     db.commit()
@@ -644,28 +647,97 @@ def get_members(
     return result
 
 
-def ensure_member_can_be_removed(db: Session, ledger_id: UUID, membership: LedgerMember):
-    """Preserve historical expense and settlement references when removing members."""
-    is_referenced = (
+def member_has_history(db: Session, ledger_id: UUID, membership: LedgerMember) -> bool:
+    expense_reference = db.query(ExpenseSplit.id).join(Expense).filter(
+        Expense.ledger_id == ledger_id,
+        ExpenseSplit.member_id == membership.id,
+    ).first()
+    if expense_reference:
+        return True
+
+    if membership.user_id is None:
+        return False
+
+    return bool(
         db.query(Expense.id).filter(
             Expense.ledger_id == ledger_id,
-            (Expense.payer_id == membership.user_id) | (Expense.created_by == membership.user_id),
-        ).first()
-        or db.query(ExpenseSplit.id).join(Expense).filter(
-            Expense.ledger_id == ledger_id,
-            ExpenseSplit.member_id == membership.id,
+            or_(
+                Expense.payer_id == membership.user_id,
+                Expense.created_by == membership.user_id,
+            ),
         ).first()
         or db.query(Settlement.id).filter(
             Settlement.ledger_id == ledger_id,
-            (Settlement.from_user_id == membership.user_id) | (Settlement.to_user_id == membership.user_id),
+            or_(
+                Settlement.from_user_id == membership.user_id,
+                Settlement.to_user_id == membership.user_id,
+            ),
         ).first()
     )
 
-    if is_referenced:
+
+def member_balance(db: Session, ledger_id: UUID, membership: LedgerMember) -> Decimal:
+    """Return paid - owed + settled for a member across non-rejected expenses."""
+    owed = (
+        db.query(func.coalesce(func.sum(ExpenseSplit.amount), 0))
+        .join(Expense)
+        .filter(
+            Expense.ledger_id == ledger_id,
+            Expense.status != ExpenseStatus.REJECTED,
+            ExpenseSplit.member_id == membership.id,
+        )
+        .scalar()
+    )
+
+    if membership.user_id is None:
+        return -Decimal(str(owed or 0))
+
+    paid = (
+        db.query(func.coalesce(func.sum(Expense.total_amount), 0))
+        .filter(
+            Expense.ledger_id == ledger_id,
+            Expense.status != ExpenseStatus.REJECTED,
+            Expense.payer_id == membership.user_id,
+        )
+        .scalar()
+    )
+    settled_out = (
+        db.query(func.coalesce(func.sum(Settlement.amount), 0))
+        .filter(
+            Settlement.ledger_id == ledger_id,
+            Settlement.from_user_id == membership.user_id,
+        )
+        .scalar()
+    )
+    settled_in = (
+        db.query(func.coalesce(func.sum(Settlement.amount), 0))
+        .filter(
+            Settlement.ledger_id == ledger_id,
+            Settlement.to_user_id == membership.user_id,
+        )
+        .scalar()
+    )
+    return (
+        Decimal(str(paid or 0))
+        - Decimal(str(owed or 0))
+        + Decimal(str(settled_out or 0))
+        - Decimal(str(settled_in or 0))
+    )
+
+
+def remove_membership(db: Session, ledger_id: UUID, membership: LedgerMember):
+    """Remove a settled member while retaining records needed by history."""
+    balance = member_balance(db, ledger_id, membership)
+    if abs(balance) >= Decimal("0.01"):
         raise HTTPException(
             status_code=400,
-            detail="Member has expenses or settlements and cannot be removed"
+            detail=f"Member still has an unsettled balance ({balance})",
         )
+
+    if member_has_history(db, ledger_id, membership):
+        membership.status = "removed"
+    else:
+        db.delete(membership)
 
 
 @router.delete("/{ledger_id}/members/me", status_code=status.HTTP_204_NO_CONTENT)
@@ -688,9 +760,7 @@ def leave_ledger(
     if not membership:
         raise HTTPException(status_code=404, detail="Not a member of this ledger")
 
-    ensure_member_can_be_removed(db, ledger_id, membership)
-
-    db.delete(membership)
+    remove_membership(db, ledger_id, membership)
     db.commit()
     return None
 
@@ -722,8 +792,6 @@ def remove_member(
     if membership.user_id == ledger.owner_id:
         raise HTTPException(status_code=400, detail="Owner cannot be removed")
 
-    ensure_member_can_be_removed(db, ledger_id, membership)
-
-    db.delete(membership)
+    remove_membership(db, ledger_id, membership)
     db.commit()
     return None

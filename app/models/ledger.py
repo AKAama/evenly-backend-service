@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, ForeignKey, Boolean, UniqueConstraint
+from sqlalchemy import Column, String, DateTime, ForeignKey, Index, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -28,21 +28,54 @@ class LedgerMember(Base):
     __tablename__ = "ledger_members"
     __table_args__ = (
         UniqueConstraint("ledger_id", "user_id", name="uq_ledger_members_ledger_user"),
-        UniqueConstraint("ledger_id", "temporary_name", name="uq_ledger_members_ledger_temporary_name"),
+        Index(
+            "uq_ledger_members_ledger_temp_name",
+            "ledger_id",
+            "display_name",
+            unique=True,
+            postgresql_where=text("user_id IS NULL"),
+            sqlite_where=text("user_id IS NULL"),
+        ),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     ledger_id = Column(UUID(as_uuid=True), ForeignKey("ledgers.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)  # nullable for temporary members
-    nickname = Column(String(100))
-    joined_at = Column(DateTime, default=datetime.utcnow)
-    
-    # Temporary member support
-    is_temporary = Column(Boolean, default=False)
-    temporary_name = Column(String(100), nullable=True)
+    display_name = Column(String(100), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
     status = Column(String(20), nullable=False, default="active")
-    invited_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
     # Relationships
     ledger = relationship("Ledger", back_populates="members")
     user = relationship("User", back_populates="memberships", foreign_keys=[user_id])
+
+    # Transitional API aliases. These are derived and are no longer columns.
+    @property
+    def nickname(self):
+        return self.display_name
+
+    @nickname.setter
+    def nickname(self, value):
+        self.display_name = value
+
+    @property
+    def joined_at(self):
+        return self.created_at
+
+    @property
+    def is_temporary(self):
+        return self.user_id is None
+
+    @is_temporary.setter
+    def is_temporary(self, value):
+        if value is False and self.user_id is None:
+            return
+
+    @property
+    def temporary_name(self):
+        return self.display_name if self.user_id is None else None
+
+    @temporary_name.setter
+    def temporary_name(self, value):
+        if value is not None:
+            self.display_name = value

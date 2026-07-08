@@ -106,13 +106,13 @@ def create_settlement(
     from_member = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger_id,
         LedgerMember.user_id == settlement.from_user_id,
-        LedgerMember.is_temporary.is_(False)
+        LedgerMember.user_id.is_not(None)
     ).first()
 
     to_member = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger_id,
         LedgerMember.user_id == settlement.to_user_id,
-        LedgerMember.is_temporary.is_(False)
+        LedgerMember.user_id.is_not(None)
     ).first()
 
     if not from_member or not to_member:
