@@ -1,10 +1,14 @@
+import asyncio
+import json
 from uuid import UUID
 from decimal import Decimal
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import joinedload, selectinload, Session
 from typing import List
 
-from app.database import get_db
+from app.config import settings
+from app.database import SessionLocal, get_db
 from app.models import User, Ledger, LedgerMember, Expense, ExpenseSplit, ExpenseConfirmation, ExpenseStatus
 from app.schemas.expense import (
     ExpenseCreate,
@@ -16,7 +20,13 @@ from app.schemas.expense import (
     VoiceExpenseDraft,
 )
 from app.schemas.user import UserResponse
-from app.services.voice_expense import VoiceExpenseError, create_voice_expense_draft
+from app.services.auth import decode_token, get_user_by_id
+from app.services.funasr import FunASRError, stream_funasr
+from app.services.voice_expense import (
+    VoiceExpenseError,
+    create_voice_expense_draft,
+    create_voice_expense_draft_from_transcript,
+)
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
@@ -26,6 +36,133 @@ CENT = Decimal("0.01")
 
 def normalize_money(value: Decimal) -> Decimal:
     return value.quantize(CENT)
+
+
+def get_active_voice_members(db: Session, ledger_id: UUID) -> list[dict[str, str | bool | None]]:
+    rows = (
+        db.query(LedgerMember)
+        .filter(
+            LedgerMember.ledger_id == ledger_id,
+            LedgerMember.status == "active",
+        )
+        .all()
+    )
+    return [
+        {
+            "member_id": str(member.id),
+            "user_id": str(member.user_id) if member.user_id else None,
+            "name": member.display_name,
+            "registered": member.user_id is not None,
+        }
+        for member in rows
+    ]
+
+
+def get_websocket_user(websocket: WebSocket, db: Session) -> User | None:
+    authorization = websocket.headers.get("authorization", "")
+    token = None
+    if authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    token = token or websocket.cookies.get(settings.auth_cookie_name)
+    if not token:
+        return None
+
+    token_data = decode_token(token)
+    if token_data is None or token_data.user_id is None:
+        return None
+    return get_user_by_id(db, token_data.user_id)
+
+
+@router.websocket("/ledgers/{ledger_id}/voice-session")
+async def create_voice_session(websocket: WebSocket, ledger_id: UUID):
+    await websocket.accept()
+    db = SessionLocal()
+    receiver = None
+    try:
+        current_user = get_websocket_user(websocket, db)
+        if current_user is None:
+            await websocket.send_json({"type": "error", "message": "未登录或登录已过期"})
+            await websocket.close(code=1008)
+            return
+
+        get_ledger_or_404(db, ledger_id)
+        require_ledger_member(db, ledger_id, current_user)
+        members = get_active_voice_members(db, ledger_id)
+
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=32)
+        receiver = asyncio.create_task(_receive_voice_audio(websocket, audio_queue))
+        await websocket.send_json({"type": "ready"})
+
+        final_segments: list[str] = []
+        latest_partial = ""
+        async for event in stream_funasr(_audio_chunks(audio_queue), wav_name=str(ledger_id)):
+            text = str(event.get("text") or "").strip()
+            if not text:
+                continue
+            if event.get("type") == "final":
+                final_segments.append(text)
+                await websocket.send_json({"type": "final_transcript", "text": text})
+            else:
+                latest_partial = text
+                await websocket.send_json({"type": "partial_transcript", "text": text})
+
+        transcript = " ".join(final_segments).strip() or latest_partial
+        draft = create_voice_expense_draft_from_transcript(
+            transcript=transcript,
+            members=members,
+            current_user_id=str(current_user.id),
+        )
+        await websocket.send_json({"type": "draft", "data": jsonable_encoder(draft)})
+        await websocket.close()
+    except WebSocketDisconnect:
+        return
+    except (FunASRError, VoiceExpenseError) as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close(code=1011)
+    except HTTPException as exc:
+        await websocket.send_json({"type": "error", "message": str(exc.detail)})
+        await websocket.close(code=1008)
+    finally:
+        if receiver:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+        db.close()
+
+
+async def _receive_voice_audio(
+    websocket: WebSocket,
+    audio_queue: asyncio.Queue[bytes | None],
+) -> None:
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                await audio_queue.put(None)
+                return
+            if "bytes" in message and message["bytes"]:
+                await audio_queue.put(message["bytes"])
+                continue
+
+            if "text" in message and message["text"]:
+                try:
+                    event = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    continue
+                event_type = event.get("type")
+                if event_type in {"stop", "cancel"}:
+                    await audio_queue.put(None)
+                    return
+    except WebSocketDisconnect:
+        await audio_queue.put(None)
+        raise
+
+
+async def _audio_chunks(audio_queue: asyncio.Queue[bytes | None]):
+    while True:
+        chunk = await audio_queue.get()
+        if chunk is None:
+            return
+        yield chunk
 
 
 @router.post("/ledgers/{ledger_id}/voice-draft", response_model=VoiceExpenseDraft)
@@ -48,23 +185,7 @@ def create_voice_draft(
     if len(audio_bytes) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="音频文件不能超过 10 MB")
 
-    rows = (
-        db.query(LedgerMember)
-        .filter(
-            LedgerMember.ledger_id == ledger_id,
-            LedgerMember.status == "active",
-        )
-        .all()
-    )
-    members = [
-        {
-            "member_id": str(member.id),
-            "user_id": str(member.user_id) if member.user_id else None,
-            "name": member.display_name,
-            "registered": member.user_id is not None,
-        }
-        for member in rows
-    ]
+    members = get_active_voice_members(db, ledger_id)
     try:
         return create_voice_expense_draft(
             audio=audio_bytes,

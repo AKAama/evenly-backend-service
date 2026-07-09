@@ -51,6 +51,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_nested_delimiter="__",
         extra="ignore",
+        populate_by_name=True,
     )
 
     # Database
@@ -85,6 +86,15 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = Field(default=None, validation_alias="OPENAI_API_KEY")
     openai_transcription_model: str = "gpt-4o-mini-transcribe"
     openai_text_model: str = "gpt-4o-mini"
+
+    # Cloud FunASR streaming endpoint. Keep provider-specific auth server-side.
+    funasr_websocket_url: Optional[str] = Field(default=None, validation_alias="FUNASR_WEBSOCKET_URL")
+    funasr_auth_header: Optional[str] = Field(default=None, validation_alias="FUNASR_AUTH_HEADER")
+    funasr_auth_token: Optional[str] = Field(default=None, validation_alias="FUNASR_AUTH_TOKEN")
+    funasr_mode: str = "2pass"
+    funasr_chunk_size: str = "5,10,5"
+    funasr_chunk_interval: int = 10
+    funasr_itn: bool = True
 
     # Request timing. Requests at or above this threshold are tagged as slow.
     slow_request_threshold_ms: float = 20.0

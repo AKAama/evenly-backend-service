@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import requests
@@ -73,8 +74,32 @@ def parse_expense_draft(
                         "properties": {
                             "title": {"type": "string"},
                             "amount": {"type": "number"},
+                            "currency": {"type": "string"},
+                            "category": {"type": ["string", "null"]},
+                            "note": {"type": ["string", "null"]},
                             "payer_user_id": {"type": "string"},
                             "participant_member_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "split_type": {
+                                "type": "string",
+                                "enum": ["equal", "exact", "unknown"],
+                            },
+                            "splits": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "member_id": {"type": "string"},
+                                        "amount": {"type": "number"},
+                                    },
+                                    "required": ["member_id", "amount"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "confidence": {"type": "number"},
+                            "missing_fields": {
                                 "type": "array",
                                 "items": {"type": "string"},
                             },
@@ -82,8 +107,15 @@ def parse_expense_draft(
                         "required": [
                             "title",
                             "amount",
+                            "currency",
+                            "category",
+                            "note",
                             "payer_user_id",
                             "participant_member_ids",
+                            "split_type",
+                            "splits",
+                            "confidence",
+                            "missing_fields",
                         ],
                         "additionalProperties": False,
                     },
@@ -101,6 +133,55 @@ def parse_expense_draft(
         raise VoiceExpenseError("账单内容解析失败") from exc
 
 
+def _normalize_money(value) -> Decimal:
+    try:
+        amount = Decimal(str(value)).quantize(Decimal("0.01"))
+    except (TypeError, InvalidOperation) as exc:
+        raise VoiceExpenseError("未能识别有效金额") from exc
+    if amount <= 0:
+        raise VoiceExpenseError("未能识别有效金额")
+    return amount
+
+
+def _build_equal_splits(amount: Decimal, participant_ids: list[str]) -> dict[str, Decimal]:
+    total_cents = int((amount * 100).to_integral_value())
+    base_cents = total_cents // len(participant_ids)
+    remainder = total_cents - base_cents * len(participant_ids)
+    splits = {}
+    for member_id in participant_ids:
+        extra_cent = 1 if remainder > 0 else 0
+        splits[member_id] = Decimal(base_cents + extra_cent) / Decimal(100)
+        remainder -= extra_cent
+    return splits
+
+
+def _resolve_splits(
+    parsed: dict,
+    amount: Decimal,
+    participant_ids: list[str],
+) -> tuple[str, dict[str, Decimal]]:
+    parsed_split_type = str(parsed.get("split_type") or "equal")
+    parsed_splits = parsed.get("splits") or []
+    exact_splits = {}
+
+    for item in parsed_splits:
+        if not isinstance(item, dict):
+            continue
+        member_id = str(item.get("member_id", ""))
+        if member_id not in participant_ids:
+            continue
+        exact_splits[member_id] = _normalize_money(item.get("amount"))
+
+    if len(exact_splits) == len(participant_ids):
+        split_total = sum(exact_splits.values(), Decimal("0.00")).quantize(Decimal("0.01"))
+        if split_total == amount:
+            if parsed_split_type == "equal":
+                return "equal", exact_splits
+            return "exact", exact_splits
+
+    return "equal", _build_equal_splits(amount, participant_ids)
+
+
 def create_voice_expense_draft(
     audio: bytes,
     filename: str,
@@ -109,6 +190,21 @@ def create_voice_expense_draft(
     current_user_id: str,
 ) -> dict:
     transcript = transcribe_audio(audio, filename, content_type)
+    return create_voice_expense_draft_from_transcript(
+        transcript=transcript,
+        members=members,
+        current_user_id=current_user_id,
+    )
+
+
+def create_voice_expense_draft_from_transcript(
+    transcript: str,
+    members: list[dict[str, str | bool | None]],
+    current_user_id: str,
+) -> dict:
+    transcript = transcript.strip()
+    if not transcript:
+        raise VoiceExpenseError("没有识别到有效语音")
     parsed = parse_expense_draft(transcript, members, current_user_id)
 
     members_by_id = {str(member["member_id"]): member for member in members}
@@ -135,22 +231,45 @@ def create_voice_expense_draft(
     if payer_member_id not in participant_ids:
         participant_ids.append(payer_member_id)
 
-    try:
-        amount = Decimal(str(parsed["amount"])).quantize(Decimal("0.01"))
-    except (KeyError, TypeError, InvalidOperation) as exc:
-        raise VoiceExpenseError("未能识别有效金额") from exc
-    if amount <= 0:
-        raise VoiceExpenseError("未能识别有效金额")
+    amount = _normalize_money(parsed.get("amount"))
+    split_type, split_amounts = _resolve_splits(parsed, amount, participant_ids)
 
     title = str(parsed.get("title", "")).strip() or "语音账单"
+    category = parsed.get("category")
+    note = str(parsed.get("note") or "").strip() or None
+    currency = str(parsed.get("currency") or "CNY").strip().upper() or "CNY"
+    missing_fields = [
+        str(item) for item in parsed.get("missing_fields", []) if str(item).strip()
+    ]
+    confidence = parsed.get("confidence")
+    if not isinstance(confidence, (int, float)):
+        confidence = None
+
     participant_names = [members_by_id[item]["name"] for item in participant_ids]
     payer_name = payer_member["name"]
+    splits = [
+        {
+            "member_id": member_id,
+            "user_id": members_by_id[member_id]["user_id"],
+            "amount": split_amounts[member_id].quantize(Decimal("0.01")),
+        }
+        for member_id in participant_ids
+    ]
     return {
         "transcript": transcript,
         "title": title,
         "amount": amount,
+        "total_amount": amount,
+        "currency": currency,
+        "category": str(category).strip() if category else None,
+        "note": note,
+        "expense_date": date.today(),
         "payer_user_id": payer_user_id,
         "participant_member_ids": participant_ids,
+        "split_type": split_type,
+        "splits": splits,
+        "confidence": float(confidence) if confidence is not None else None,
+        "missing_fields": missing_fields,
         "confirmation_text": (
             f"已生成{title}，金额{amount}元，{payer_name}付款，"
             f"参与人是{'、'.join(str(name) for name in participant_names)}。请确认。"

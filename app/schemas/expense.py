@@ -1,7 +1,7 @@
 from datetime import datetime, date
 from uuid import UUID
 from decimal import Decimal
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.user import UserResponse
 
@@ -72,10 +72,25 @@ class ConfirmExpenseRequest(BaseModel):
     status: str  # 'confirmed' or 'rejected'
 
 
+class VoiceExpenseSplitDraft(BaseModel):
+    member_id: UUID
+    user_id: UUID | None = None
+    amount: Decimal
+
+
 class VoiceExpenseDraft(BaseModel):
     transcript: str
     title: str
     amount: Decimal
+    total_amount: Decimal | None = None
+    currency: str = "CNY"
+    category: str | None = None
+    note: str | None = None
+    expense_date: date = Field(default_factory=date.today)
     payer_user_id: UUID
     participant_member_ids: list[UUID]
+    split_type: str = "equal"
+    splits: list[VoiceExpenseSplitDraft] = Field(default_factory=list)
+    confidence: float | None = None
+    missing_fields: list[str] = Field(default_factory=list)
     confirmation_text: str

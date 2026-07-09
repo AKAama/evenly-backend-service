@@ -211,6 +211,87 @@ def test_voice_expense_draft_filters_unknown_and_duplicate_members(monkeypatch):
 
     assert draft["payer_user_id"] == owner_id
     assert draft["participant_member_ids"] == [friend_member_id, owner_member_id]
+    assert draft["total_amount"] == Decimal("88.00")
+    assert draft["split_type"] == "equal"
+    assert draft["splits"] == [
+        {
+            "member_id": friend_member_id,
+            "user_id": None,
+            "amount": Decimal("44.00"),
+        },
+        {
+            "member_id": owner_member_id,
+            "user_id": owner_id,
+            "amount": Decimal("44.00"),
+        },
+    ]
+
+
+def test_voice_expense_draft_accepts_valid_exact_splits(monkeypatch):
+    owner_id = str(uuid.uuid4())
+    owner_member_id = str(uuid.uuid4())
+    friend_member_id = str(uuid.uuid4())
+    members = [
+        {
+            "member_id": owner_member_id,
+            "user_id": owner_id,
+            "name": "Owner",
+            "registered": True,
+        },
+        {
+            "member_id": friend_member_id,
+            "user_id": None,
+            "name": "Friend",
+            "registered": False,
+        },
+    ]
+    monkeypatch.setattr(
+        "app.services.voice_expense.transcribe_audio",
+        lambda *_: "午饭 88 元，我 58，Friend 30",
+    )
+    monkeypatch.setattr(
+        "app.services.voice_expense.parse_expense_draft",
+        lambda *_: {
+            "title": "午饭",
+            "amount": 88,
+            "currency": "CNY",
+            "category": "餐饮",
+            "note": "午饭",
+            "payer_user_id": owner_id,
+            "participant_member_ids": [owner_member_id, friend_member_id],
+            "split_type": "exact",
+            "splits": [
+                {"member_id": owner_member_id, "amount": 58},
+                {"member_id": friend_member_id, "amount": 30},
+            ],
+            "confidence": 0.92,
+            "missing_fields": [],
+        },
+    )
+
+    draft = create_voice_expense_draft(
+        audio=b"recording",
+        filename="voice.m4a",
+        content_type="audio/mp4",
+        members=members,
+        current_user_id=owner_id,
+    )
+
+    assert draft["category"] == "餐饮"
+    assert draft["note"] == "午饭"
+    assert draft["split_type"] == "exact"
+    assert draft["splits"] == [
+        {
+            "member_id": owner_member_id,
+            "user_id": owner_id,
+            "amount": Decimal("58.00"),
+        },
+        {
+            "member_id": friend_member_id,
+            "user_id": None,
+            "amount": Decimal("30.00"),
+        },
+    ]
 
 
 def assert_http_error(exc_info, status_code):
