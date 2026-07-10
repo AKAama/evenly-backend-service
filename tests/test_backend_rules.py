@@ -11,6 +11,7 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 from fastapi import HTTPException
 from starlette.datastructures import Headers, UploadFile
 from fastapi.testclient import TestClient
@@ -759,6 +760,67 @@ def test_ledger_summary_counts_members_and_expenses(db):
     assert len(result) == 1
     assert result[0].member_count == 3
     assert result[0].expense_count == 1
+
+
+@pytest.mark.parametrize(
+    ("icon_type", "icon_value"),
+    [("sf_symbol", "fork.knife"), ("emoji", "🍜")],
+)
+def test_expense_category_icon_is_persisted(db, icon_type, icon_value):
+    owner = make_user(db, f"{icon_type}@example.com", "Owner")
+    ledger = make_ledger(db, owner)
+
+    expense = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="午餐",
+            total_amount=Decimal("20.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[ExpenseSplitCreate(user_id=owner.id, amount=Decimal("20.00"))],
+            category="餐饮",
+            icon_type=icon_type,
+            icon_value=icon_value,
+        ),
+        db=db,
+        current_user=owner,
+    )
+
+    assert expense.category == "餐饮"
+    assert expense.icon_type == icon_type
+    assert expense.icon_value == icon_value
+
+
+def test_expense_without_category_icon_remains_compatible():
+    payload = ExpenseCreate(
+        title="旧账单",
+        total_amount=Decimal("10.00"),
+        expense_date=date.today(),
+        payer_id=uuid.uuid4(),
+        splits=[ExpenseSplitCreate(user_id=uuid.uuid4(), amount=Decimal("10.00"))],
+    )
+
+    assert payload.category is None
+    assert payload.icon_type is None
+    assert payload.icon_value is None
+
+
+@pytest.mark.parametrize(
+    ("icon_type", "icon_value"),
+    [("unknown", "fork.knife"), ("sf_symbol", "not.allowed"), ("emoji", "🍜🍚"), (None, "🍜")],
+)
+def test_invalid_expense_icon_is_rejected(icon_type, icon_value):
+    with pytest.raises(ValidationError):
+        ExpenseCreate(
+            title="Invalid icon",
+            total_amount=Decimal("10.00"),
+            expense_date=date.today(),
+            payer_id=uuid.uuid4(),
+            splits=[ExpenseSplitCreate(user_id=uuid.uuid4(), amount=Decimal("10.00"))],
+            category="餐饮",
+            icon_type=icon_type,
+            icon_value=icon_value,
+        )
 
 
 @pytest.mark.asyncio

@@ -1,9 +1,28 @@
 from datetime import datetime, date
 from uuid import UUID
 from decimal import Decimal
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.user import UserResponse
+
+
+ALLOWED_EXPENSE_SF_SYMBOLS = {
+    "fork.knife", "sunrise.fill", "sun.max.fill", "moon.stars.fill",
+    "cup.and.saucer.fill", "takeoutbag.and.cup.and.straw.fill",
+    "car.fill", "train.side.front.car", "tram.fill", "airplane",
+    "fuelpump.fill", "bed.double.fill", "building.2.fill", "house.fill",
+    "ticket.fill", "cart.fill", "bag.fill", "gift.fill", "gamecontroller.fill",
+    "film.fill", "music.note", "cross.case.fill", "pills.fill", "book.fill",
+    "graduationcap.fill", "pawprint.fill", "figure.walk", "dumbbell.fill",
+    "ellipsis.circle.fill",
+}
+ALLOWED_EXPENSE_EMOJIS = {
+    "🍜", "🍚", "🍔", "🍕", "☕️", "🍺", "🚕", "🚄", "🚇", "✈️",
+    "⛽️", "🏨", "🏠", "🎫", "🛒", "🛍️", "🎁", "🎮", "🎬", "🎵",
+    "🏥", "💊", "📚", "🎓", "🐾", "🏃", "🏋️", "💡", "💰", "🧾",
+}
 
 
 class ExpenseSplitBase(BaseModel):
@@ -43,6 +62,20 @@ class ExpenseBase(BaseModel):
     total_amount: Decimal
     note: str | None = None
     expense_date: date
+    category: str | None = Field(default=None, max_length=50)
+    icon_type: Literal["sf_symbol", "emoji"] | None = None
+    icon_value: str | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_icon(self):
+        if self.icon_type is None and self.icon_value is None:
+            return self
+        if self.icon_type is None or self.icon_value is None:
+            raise ValueError("icon_type and icon_value must be provided together")
+        allowed = ALLOWED_EXPENSE_SF_SYMBOLS if self.icon_type == "sf_symbol" else ALLOWED_EXPENSE_EMOJIS
+        if self.icon_value not in allowed:
+            raise ValueError("Unsupported expense icon")
+        return self
 
 
 class ExpenseCreate(ExpenseBase):

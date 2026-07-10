@@ -29,6 +29,11 @@ class Expense(Base):
     __tablename__ = "expenses"
     __table_args__ = (
         CheckConstraint("total_amount > 0", name="ck_expenses_total_amount_positive"),
+        CheckConstraint(
+            "(icon_type IS NULL AND icon_value IS NULL) OR "
+            "(icon_type IN ('sf_symbol', 'emoji') AND icon_value IS NOT NULL)",
+            name="ck_expenses_icon_pair",
+        ),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -38,6 +43,9 @@ class Expense(Base):
     title = Column(String(255))
     total_amount = Column(Numeric(12, 2), nullable=False)
     note = Column(Text)
+    category = Column(String(50), nullable=True)
+    icon_type = Column(String(20), nullable=True)
+    icon_value = Column(String(100), nullable=True)
     expense_date = Column(Date, nullable=False)
     status = Column(SQLEnum(ExpenseStatus), default=ExpenseStatus.PENDING, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)

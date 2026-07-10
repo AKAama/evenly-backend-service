@@ -454,6 +454,9 @@ def create_expense(
         title=expense.title,
         total_amount=expense.total_amount,
         note=expense.note,
+        category=expense.category,
+        icon_type=expense.icon_type,
+        icon_value=expense.icon_value,
         expense_date=expense.expense_date,
         status=ExpenseStatus.PENDING,
     )

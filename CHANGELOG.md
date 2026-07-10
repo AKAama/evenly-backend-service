@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-07-10 — Synchronized expense category icons
+
+- Expenses can persist a category and a validated SF Symbol or Emoji icon.
+- Added nullable API fields and a backwards-compatible database migration.
+
 ## 2026-07-10 — Live ledger member names
 
 - Registered ledger members now always display their current user nickname.
