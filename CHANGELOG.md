@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-10 — Live ledger member names
+
+- Registered ledger members now always display their current user nickname.
+- Temporary member names remain stored independently on the ledger membership.
+- Added database constraints and eager user loading to prevent invalid rows and N+1 name lookups.
+
 ## 2026-07-10
 
 ### Added

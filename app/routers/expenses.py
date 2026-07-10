@@ -44,6 +44,7 @@ def normalize_money(value: Decimal) -> Decimal:
 def get_active_voice_members(db: Session, ledger_id: UUID) -> list[dict[str, str | bool | None]]:
     rows = (
         db.query(LedgerMember)
+        .options(joinedload(LedgerMember.user))
         .filter(
             LedgerMember.ledger_id == ledger_id,
             LedgerMember.status == "active",

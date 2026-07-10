@@ -32,7 +32,7 @@ from app.models import (
     User,
 )
 from app.routers.expenses import confirm_expense, create_expense, delete_expense
-from app.routers.ledgers import accept_invitation, create_ledger, get_ledger, get_ledgers, remove_member
+from app.routers.ledgers import accept_invitation, create_ledger, get_ledger, get_ledgers, get_members, remove_member
 from app.routers import users as users_router
 from app.schemas.ledger import LedgerCreate, MemberCreate
 from app.routers.settlements import create_settlement, get_settlements
@@ -197,6 +197,36 @@ def test_settings_layer_defaults_local_config_and_environment(tmp_path, monkeypa
 def add_member(db, ledger, user):
     db.add(LedgerMember(ledger_id=ledger.id, user_id=user.id, display_name=user.display_name))
     db.commit()
+
+
+def test_registered_ledger_member_name_follows_current_user_display_name(db):
+    user = make_user(db, "live-name@example.com", "旧昵称")
+    ledger = Ledger(name="Live names", owner_id=user.id, currency="CNY")
+    db.add(ledger)
+    db.flush()
+    member = LedgerMember(ledger_id=ledger.id, user_id=user.id, display_name="旧昵称")
+    db.add(member)
+    db.commit()
+
+    user.display_name = "新昵称"
+    db.commit()
+
+    assert member.nickname == "新昵称"
+    response = get_members(ledger.id, db=db, current_user=user)
+    assert response[0].nickname == "新昵称"
+
+
+def test_temporary_ledger_member_keeps_its_own_name(db):
+    owner = make_user(db, "temp-owner@example.com", "Owner")
+    ledger = Ledger(name="Temporary names", owner_id=owner.id, currency="CNY")
+    db.add(ledger)
+    db.flush()
+    member = LedgerMember(ledger_id=ledger.id, user_id=None, display_name="临时成员")
+    db.add(member)
+    db.commit()
+
+    assert member.nickname == "临时成员"
+    assert member.temporary_name == "临时成员"
 
 
 def test_voice_expense_draft_endpoint_returns_ai_draft(db, client, monkeypatch):

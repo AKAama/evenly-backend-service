@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, ForeignKey, Index, UniqueConstraint, text
+from sqlalchemy import CheckConstraint, Column, String, DateTime, ForeignKey, Index, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -31,17 +31,22 @@ class LedgerMember(Base):
         Index(
             "uq_ledger_members_ledger_temp_name",
             "ledger_id",
-            "display_name",
+            "temporary_name",
             unique=True,
             postgresql_where=text("user_id IS NULL"),
             sqlite_where=text("user_id IS NULL"),
+        ),
+        CheckConstraint(
+            "(user_id IS NOT NULL AND temporary_name IS NULL) OR "
+            "(user_id IS NULL AND temporary_name IS NOT NULL AND length(trim(temporary_name)) > 0)",
+            name="ck_ledger_members_registered_or_temporary_name",
         ),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     ledger_id = Column(UUID(as_uuid=True), ForeignKey("ledgers.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)  # nullable for temporary members
-    display_name = Column(String(100), nullable=False)
+    temporary_name = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     status = Column(String(20), nullable=False, default="active")
 
@@ -59,6 +64,17 @@ class LedgerMember(Base):
         self.display_name = value
 
     @property
+    def display_name(self):
+        if self.user_id is not None:
+            return (self.user.display_name or self.user.email) if self.user is not None else None
+        return self.temporary_name
+
+    @display_name.setter
+    def display_name(self, value):
+        if self.user_id is None:
+            self.temporary_name = value
+
+    @property
     def joined_at(self):
         return self.created_at
 
@@ -70,12 +86,3 @@ class LedgerMember(Base):
     def is_temporary(self, value):
         if value is False and self.user_id is None:
             return
-
-    @property
-    def temporary_name(self):
-        return self.display_name if self.user_id is None else None
-
-    @temporary_name.setter
-    def temporary_name(self, value):
-        if value is not None:
-            self.display_name = value

@@ -77,7 +77,6 @@ def create_ledger(
     owner_member = LedgerMember(
         ledger_id=db_ledger.id,
         user_id=current_user.id,
-        nickname=current_user.display_name,
         status="active",
     )
     db.add(owner_member)
@@ -110,7 +109,6 @@ def create_ledger(
             member = LedgerMember(
                 ledger_id=db_ledger.id,
                 user_id=member_data.user_id,
-                nickname=member_data.nickname or user.display_name,
                 status="pending",
             )
         
@@ -138,7 +136,6 @@ def create_ledger(
     owner_member_response = MemberResponse(
         id=owner_member.id,
         user_id=current_user.id,
-        nickname=current_user.display_name,
         joined_at=owner_member.joined_at,
         user=owner_user_response,
         is_temporary=False,
@@ -508,7 +505,7 @@ def add_member(
         existing = db.query(LedgerMember).filter(
             LedgerMember.ledger_id == ledger_id,
             LedgerMember.user_id.is_(None),
-            LedgerMember.display_name == request.temporary_name,
+            LedgerMember.temporary_name == request.temporary_name,
         ).first()
 
         if existing and existing.status == "removed":
@@ -577,7 +574,6 @@ def add_member(
 
     if existing and existing.status == "removed":
         existing.status = "pending"
-        existing.nickname = request.nickname or user.display_name
         db.commit()
         db.refresh(existing)
         return MemberResponse(
@@ -599,7 +595,6 @@ def add_member(
     member = LedgerMember(
         ledger_id=ledger_id,
         user_id=request.user_id,
-        nickname=request.nickname or user.display_name,
         status="pending",
     )
     db.add(member)
@@ -628,12 +623,15 @@ def get_members(
     """Get all members of a ledger (including pending invitations so members can see who hasn't joined yet)"""
     require_ledger_member(db, ledger_id, current_user)
 
-    members = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-    ).all()
+    members = (
+        db.query(LedgerMember)
+        .options(joinedload(LedgerMember.user))
+        .filter(LedgerMember.ledger_id == ledger_id)
+        .all()
+    )
     result = []
     for m in members:
-        user = db.query(User).filter(User.id == m.user_id).first() if m.user_id and not m.is_temporary else None
+        user = m.user if m.user_id and not m.is_temporary else None
         result.append(MemberResponse(
             id=m.id,
             user_id=m.user_id,
