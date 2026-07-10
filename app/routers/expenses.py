@@ -1,6 +1,8 @@
 import asyncio
 import json
-from uuid import UUID
+import logging
+from time import perf_counter
+from uuid import UUID, uuid4
 from decimal import Decimal
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.encoders import jsonable_encoder
@@ -21,7 +23,7 @@ from app.schemas.expense import (
 )
 from app.schemas.user import UserResponse
 from app.services.auth import decode_token, get_user_by_id
-from app.services.funasr import FunASRError, stream_funasr
+from app.services.tencent_asr import TencentASRError, stream_tencent_asr
 from app.services.voice_expense import (
     VoiceExpenseError,
     create_voice_expense_draft,
@@ -30,6 +32,7 @@ from app.services.voice_expense import (
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
+logger = logging.getLogger(__name__)
 
 CENT = Decimal("0.01")
 
@@ -75,12 +78,31 @@ def get_websocket_user(websocket: WebSocket, db: Session) -> User | None:
 
 @router.websocket("/ledgers/{ledger_id}/voice-session")
 async def create_voice_session(websocket: WebSocket, ledger_id: UUID):
+    session_id = uuid4().hex[:8]
+    started_at = perf_counter()
+    audio_stats = {"chunks": 0, "bytes": 0, "first_chunk_at": None, "stop_at": None}
+    client = f"{websocket.client.host}:{websocket.client.port}" if websocket.client else "unknown"
+
+    def _elapsed_ms() -> float:
+        return (perf_counter() - started_at) * 1000
+
+    logger.info(
+        "语音会话已连接 session_id=%s ledger_id=%s client=%s",
+        session_id,
+        ledger_id,
+        client,
+    )
     await websocket.accept()
     db = SessionLocal()
     receiver = None
     try:
         current_user = get_websocket_user(websocket, db)
         if current_user is None:
+            logger.warning(
+                "语音会话鉴权失败 session_id=%s ledger_id=%s reason=未登录或 token 无效",
+                session_id,
+                ledger_id,
+            )
             await websocket.send_json({"type": "error", "message": "未登录或登录已过期"})
             await websocket.close(code=1008)
             return
@@ -90,56 +112,181 @@ async def create_voice_session(websocket: WebSocket, ledger_id: UUID):
         members = get_active_voice_members(db, ledger_id)
 
         audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=32)
-        receiver = asyncio.create_task(_receive_voice_audio(websocket, audio_queue))
+        receiver = asyncio.create_task(_receive_voice_audio(
+            websocket,
+            audio_queue,
+            session_id=session_id,
+            audio_stats=audio_stats,
+        ))
         await websocket.send_json({"type": "ready"})
+        logger.info(
+            "语音会话已就绪 session_id=%s ledger_id=%s user_id=%s member_count=%d",
+            session_id,
+            ledger_id,
+            current_user.id,
+            len(members),
+        )
 
+        asr_started_at = perf_counter()
         final_segments: list[str] = []
         latest_partial = ""
-        async for event in stream_funasr(_audio_chunks(audio_queue), wav_name=str(ledger_id)):
+        # 把当前账本成员名字作为热词传给腾讯 ASR（同音替换权重 100）
+        voice_hotwords = [str(m.get("name") or "").strip() for m in members]
+        voice_hotwords = [w for w in voice_hotwords if w]
+        logger.info("语音会话热词 session_id=%s hotwords=%s", session_id, voice_hotwords)
+        async for event in stream_tencent_asr(
+            _audio_chunks(audio_queue, audio_stats=audio_stats),
+            wav_name=str(ledger_id),
+            session_id=session_id,
+            hotwords=voice_hotwords,
+        ):
             text = str(event.get("text") or "").strip()
             if not text:
                 continue
             if event.get("type") == "final":
                 final_segments.append(text)
+                logger.info(
+                    "语音会话收到最终转写 session_id=%s segment_chars=%d final_segment_count=%d elapsed_ms=%.0f",
+                    session_id,
+                    len(text),
+                    len(final_segments),
+                    _elapsed_ms(),
+                )
                 await websocket.send_json({"type": "final_transcript", "text": text})
             else:
                 latest_partial = text
+                logger.debug(
+                    "语音会话收到部分转写 session_id=%s text_chars=%d elapsed_ms=%.0f",
+                    session_id,
+                    len(text),
+                    _elapsed_ms(),
+                )
                 await websocket.send_json({"type": "partial_transcript", "text": text})
 
+        asr_done_at = perf_counter()
         transcript = " ".join(final_segments).strip() or latest_partial
+        first_chunk_at = audio_stats.get("first_chunk_at")
+        stop_at = audio_stats.get("stop_at")
+        logger.info(
+            "语音会话识别完成 session_id=%s transcript_chars=%d final_segment_count=%d "
+            "audio_chunks=%d audio_bytes=%d "
+            "phase_ms={accept=%.0f, first_audio=%.0f, stop=%.0f, asr=%.0f, tail_after_stop=%.0f} total_ms=%.0f",
+            session_id,
+            len(transcript),
+            len(final_segments),
+            audio_stats["chunks"],
+            audio_stats["bytes"],
+            (first_chunk_at - started_at) * 1000 if first_chunk_at else -1,
+            (first_chunk_at - started_at) * 1000 if first_chunk_at else -1,
+            (stop_at - started_at) * 1000 if stop_at else -1,
+            (asr_done_at - asr_started_at) * 1000,
+            (asr_done_at - stop_at) * 1000 if stop_at else -1,
+            _elapsed_ms(),
+        )
+        if not transcript:
+            raise VoiceExpenseError("没有识别到语音内容，请再试一次")
+
+        llm_started_at = perf_counter()
         draft = create_voice_expense_draft_from_transcript(
             transcript=transcript,
             members=members,
             current_user_id=str(current_user.id),
         )
+        llm_done_at = perf_counter()
+        participant_count = len(draft.get("participant_member_ids", [])) if isinstance(draft, dict) else 0
+        logger.info(
+            "语音会话生成草稿成功 session_id=%s amount=%s participant_count=%d llm_ms=%.0f total_ms=%.0f",
+            session_id,
+            draft.get("amount") if isinstance(draft, dict) else None,
+            participant_count,
+            (llm_done_at - llm_started_at) * 1000,
+            _elapsed_ms(),
+        )
         await websocket.send_json({"type": "draft", "data": jsonable_encoder(draft)})
         await websocket.close()
     except WebSocketDisconnect:
+        logger.info(
+            "语音会话客户端断开 session_id=%s ledger_id=%s audio_chunks=%d audio_bytes=%d",
+            session_id,
+            ledger_id,
+            audio_stats["chunks"],
+            audio_stats["bytes"],
+        )
         return
-    except (FunASRError, VoiceExpenseError) as exc:
+    except (TencentASRError, VoiceExpenseError) as exc:
+        logger.warning(
+            "语音会话失败 session_id=%s ledger_id=%s error=%s",
+            session_id,
+            ledger_id,
+            str(exc),
+        )
         await websocket.send_json({"type": "error", "message": str(exc)})
         await websocket.close(code=1011)
     except HTTPException as exc:
+        logger.warning(
+            "语音会话请求被拒绝 session_id=%s ledger_id=%s status_code=%s detail=%s",
+            session_id,
+            ledger_id,
+            exc.status_code,
+            exc.detail,
+        )
         await websocket.send_json({"type": "error", "message": str(exc.detail)})
         await websocket.close(code=1008)
+    except Exception as exc:
+        logger.exception(
+            "语音会话未知异常 session_id=%s ledger_id=%s error=%s",
+            session_id,
+            ledger_id,
+            str(exc),
+        )
+        await websocket.send_json({"type": "error", "message": "语音记账服务异常，请稍后重试"})
+        await websocket.close(code=1011)
     finally:
         if receiver:
             receiver.cancel()
             await asyncio.gather(receiver, return_exceptions=True)
         db.close()
+        logger.info(
+            "语音会话结束 session_id=%s ledger_id=%s audio_chunks=%d audio_bytes=%d duration_ms=%.2f",
+            session_id,
+            ledger_id,
+            audio_stats["chunks"],
+            audio_stats["bytes"],
+            (perf_counter() - started_at) * 1000,
+        )
 
 
 async def _receive_voice_audio(
     websocket: WebSocket,
     audio_queue: asyncio.Queue[bytes | None],
+    *,
+    session_id: str,
+    audio_stats: dict[str, int],
 ) -> None:
     try:
         while True:
             message = await websocket.receive()
             if message.get("type") == "websocket.disconnect":
+                logger.info(
+                    "语音会话客户端断开音频输入 session_id=%s audio_chunks=%d audio_bytes=%d",
+                    session_id,
+                    audio_stats["chunks"],
+                    audio_stats["bytes"],
+                )
                 await audio_queue.put(None)
                 return
             if "bytes" in message and message["bytes"]:
+                audio_stats["chunks"] += 1
+                audio_stats["bytes"] += len(message["bytes"])
+                if audio_stats["chunks"] == 1:
+                    audio_stats["first_chunk_at"] = perf_counter()
+                if audio_stats["chunks"] == 1 or audio_stats["chunks"] % 50 == 0:
+                    logger.info(
+                        "语音会话收到音频数据 session_id=%s audio_chunks=%d audio_bytes=%d",
+                        session_id,
+                        audio_stats["chunks"],
+                        audio_stats["bytes"],
+                    )
                 await audio_queue.put(message["bytes"])
                 continue
 
@@ -147,17 +294,53 @@ async def _receive_voice_audio(
                 try:
                     event = json.loads(message["text"])
                 except json.JSONDecodeError:
+                    logger.warning(
+                        "语音会话收到无效控制消息 session_id=%s raw_chars=%d",
+                        session_id,
+                        len(message["text"]),
+                    )
                     continue
                 event_type = event.get("type")
+                if event_type == "start":
+                    audio = event.get("audio") if isinstance(event.get("audio"), dict) else {}
+                    logger.info(
+                        "语音会话收到开始元信息 session_id=%s format=%s sample_rate=%s channels=%s",
+                        session_id,
+                        audio.get("format"),
+                        audio.get("sample_rate"),
+                        audio.get("channels"),
+                    )
+                    continue
                 if event_type in {"stop", "cancel"}:
+                    log_message = "语音会话收到停止指令" if event_type == "stop" else "语音会话收到取消指令"
+                    if event_type == "stop":
+                        audio_stats["stop_at"] = perf_counter()
+                    logger.info(
+                        "%s session_id=%s audio_chunks=%d audio_bytes=%d",
+                        log_message,
+                        session_id,
+                        audio_stats["chunks"],
+                        audio_stats["bytes"],
+                    )
                     await audio_queue.put(None)
                     return
+                logger.warning(
+                    "语音会话收到未知控制消息 session_id=%s event_type=%s",
+                    session_id,
+                    event_type,
+                )
     except WebSocketDisconnect:
+        logger.info(
+            "语音会话音频接收断开 session_id=%s audio_chunks=%d audio_bytes=%d",
+            session_id,
+            audio_stats["chunks"],
+            audio_stats["bytes"],
+        )
         await audio_queue.put(None)
         raise
 
 
-async def _audio_chunks(audio_queue: asyncio.Queue[bytes | None]):
+async def _audio_chunks(audio_queue: asyncio.Queue[bytes | None], *, audio_stats=None):
     while True:
         chunk = await audio_queue.get()
         if chunk is None:

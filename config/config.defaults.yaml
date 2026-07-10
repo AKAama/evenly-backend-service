@@ -1,0 +1,46 @@
+db:
+  host: localhost
+  port: 5432
+  database: evenly
+  user: postgres
+  password: postgres
+
+cors:
+  allow_origins:
+    - http://localhost:5173
+  allow_credentials: true
+  allow_methods:
+    - "*"
+  allow_headers:
+    - "*"
+
+verification_code_expire_seconds: 600
+verification_send_interval_seconds: 60
+
+jwt_secret_key: your-secret-key-change-in-production
+jwt_expire_minutes: 1440
+algorithm: HS256
+auth_cookie_name: evenly_access_token
+auth_cookie_secure: false
+auth_cookie_samesite: lax
+apple_client_id: com.yhma.Evenly
+
+# 语音转草稿：OpenAI-compatible Chat Completions
+openai_transcription_model: gpt-4o-mini-transcribe
+openai_text_model: gpt-4o-mini
+openai_url: https://api.openai.com/v1/chat/completions
+
+# 腾讯云实时语音识别（WebSocket）
+# 必填：在 config.yaml 中填你的 AppId / SecretId / SecretKey
+asr_engine_model_type: "16k_zh"
+asr_endpoint: "wss://asr.cloud.tencent.com/asr/v2/"
+asr_needvad: 1
+asr_vad_silence_time: 800
+asr_filter_modal: 2         # 2 = 严格过滤嗯/啊/那个等填充词
+asr_filter_punc: 0
+asr_convert_num_mode: 1     # 1 = 智能阿拉伯数字
+asr_hotword_weight: 100     # 100 = 同音字替换（最适合人名）
+asr_connect_timeout_seconds: 10
+asr_final_timeout_seconds: 5
+
+slow_request_threshold_ms: 20.0

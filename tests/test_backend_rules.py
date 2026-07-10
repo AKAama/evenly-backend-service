@@ -1,4 +1,11 @@
+import asyncio
+import json
+import logging
+import sys
+import types
 import uuid
+import textwrap
+from pathlib import Path
 from io import BytesIO
 from datetime import date
 from decimal import Decimal
@@ -32,8 +39,11 @@ from app.routers.settlements import create_settlement, get_settlements
 from app.schemas.expense import ConfirmExpenseRequest, ExpenseCreate, ExpenseSplitCreate
 from app.schemas.settlement import SettlementCreate
 from app.services import verification
+from app.services.tencent_asr import TencentASRError, _build_hotword_list, stream_tencent_asr
 from app.services.auth import get_password_hash
-from app.services.voice_expense import create_voice_expense_draft
+from app.services.voice_expense import create_voice_expense_draft, parse_expense_draft
+from app.routers.expenses import _receive_voice_audio
+from app.config import load_settings, settings as app_settings
 from main import app
 
 
@@ -92,7 +102,11 @@ def make_login_user(db, email, display_name, password="secret123"):
 
 
 @pytest.fixture()
-def client(db):
+def client(db, monkeypatch):
+    monkeypatch.setattr(app_settings, "auth_cookie_name", "evenly_access_token")
+    monkeypatch.setattr(app_settings, "auth_cookie_secure", False)
+    monkeypatch.setattr(app_settings, "auth_cookie_samesite", "lax")
+
     def override_get_db():
         yield db
 
@@ -118,6 +132,66 @@ def make_ledger(db, owner, *, with_temp_member=False):
         ))
     db.commit()
     return ledger
+
+
+def test_settings_layer_defaults_local_config_and_environment(tmp_path, monkeypatch):
+    defaults_path = tmp_path / "config.defaults.yaml"
+    config_path = tmp_path / "config.yaml"
+    defaults_path.write_text(textwrap.dedent("""
+        db:
+          host: default-db
+          port: 5432
+          database: evenly
+          user: postgres
+          password: postgres
+        verification_code_expire_seconds: 600
+        verification_send_interval_seconds: 60
+        jwt_secret_key: default-secret
+        jwt_expire_minutes: 1440
+        algorithm: HS256
+        auth_cookie_name: evenly_access_token
+        auth_cookie_secure: false
+        auth_cookie_samesite: lax
+        apple_client_id: com.yhma.Evenly
+        openai_url: https://api.openai.com/v1/chat/completions
+        openai_transcription_model: gpt-4o-mini-transcribe
+        openai_text_model: gpt-4o-mini
+        asr_engine_model_type: "16k_zh"
+        asr_endpoint: "wss://asr.cloud.tencent.com/asr/v2/"
+        asr_needvad: 1
+        asr_vad_silence_time: 800
+        asr_filter_modal: 2
+        asr_filter_punc: 0
+        asr_convert_num_mode: 1
+        asr_hotword_weight: 100
+        asr_connect_timeout_seconds: 10
+        asr_final_timeout_seconds: 5
+        slow_request_threshold_ms: 20.0
+    """))
+    config_path.write_text(textwrap.dedent("""
+        db:
+          host: local-db
+        jwt_secret_key: local-secret
+        auth_cookie_secure: false
+        DASHSCOPE_RESPONSES_URL: https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions
+        asr_vad_silence_time: 500
+        asr_final_timeout_seconds: 3
+    """))
+    monkeypatch.setenv("AUTH_COOKIE_SECURE", "true")
+    monkeypatch.setenv("REDIS_URL", "redis://env-redis:6379/0")
+
+    settings = load_settings(config_path=config_path, defaults_path=defaults_path)
+
+    assert settings.db.host == "local-db"
+    assert settings.db.port == 5432
+    assert settings.jwt_secret_key == "local-secret"
+    assert settings.jwt_expire_minutes == 1440
+    assert settings.auth_cookie_secure is True
+    assert settings.redis_url == "redis://env-redis:6379/0"
+    assert settings.openai_url == "https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
+    assert settings.asr_vad_silence_time == 500
+    assert settings.asr_engine_model_type == "16k_zh"
+    assert settings.asr_final_timeout_seconds == 3
 
 
 def add_member(db, ledger, user):
@@ -212,86 +286,364 @@ def test_voice_expense_draft_filters_unknown_and_duplicate_members(monkeypatch):
     assert draft["payer_user_id"] == owner_id
     assert draft["participant_member_ids"] == [friend_member_id, owner_member_id]
     assert draft["total_amount"] == Decimal("88.00")
-    assert draft["split_type"] == "equal"
-    assert draft["splits"] == [
-        {
-            "member_id": friend_member_id,
-            "user_id": None,
-            "amount": Decimal("44.00"),
-        },
-        {
-            "member_id": owner_member_id,
-            "user_id": owner_id,
-            "amount": Decimal("44.00"),
-        },
-    ]
+    # splits 不在草稿阶段计算，客户端会在提交账单时自行平分
+    assert draft["splits"] == []
 
 
-def test_voice_expense_draft_accepts_valid_exact_splits(monkeypatch):
+def test_voice_expense_prompt_sends_members_and_matching_guidance(monkeypatch):
     owner_id = str(uuid.uuid4())
     owner_member_id = str(uuid.uuid4())
-    friend_member_id = str(uuid.uuid4())
+    temporary_member_id = str(uuid.uuid4())
     members = [
         {
             "member_id": owner_member_id,
             "user_id": owner_id,
-            "name": "Owner",
+            "name": "我",
             "registered": True,
         },
         {
-            "member_id": friend_member_id,
+            "member_id": temporary_member_id,
             "user_id": None,
-            "name": "Friend",
+            "name": "小王",
             "registered": False,
         },
     ]
-    monkeypatch.setattr(
-        "app.services.voice_expense.transcribe_audio",
-        lambda *_: "午饭 88 元，我 58，Friend 30",
-    )
-    monkeypatch.setattr(
-        "app.services.voice_expense.parse_expense_draft",
-        lambda *_: {
-            "title": "午饭",
-            "amount": 88,
-            "currency": "CNY",
-            "category": "餐饮",
-            "note": "午饭",
-            "payer_user_id": owner_id,
-            "participant_member_ids": [owner_member_id, friend_member_id],
-            "split_type": "exact",
-            "splits": [
-                {"member_id": owner_member_id, "amount": 58},
-                {"member_id": friend_member_id, "amount": 30},
-            ],
-            "confidence": 0.92,
-            "missing_fields": [],
-        },
+    captured = {}
+
+    class FakeResponse:
+        ok = True
+        status_code = 200
+        content = b"{}"
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json_text({
+                                "title": "住宿",
+                                "amount": 500,
+                                "currency": "CNY",
+                                "category": "住宿",
+                                "note": "住宿",
+                                "payer_user_id": owner_id,
+                                "participant_member_ids": [owner_member_id, temporary_member_id],
+                                "confidence": 0.9,
+                                "missing_fields": [],
+                            }),
+                        }
+                    }
+                ]
+            }
+
+    def fake_post(url, headers, json, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["payload"] = json
+        return FakeResponse()
+
+    chat_url = "https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
+    monkeypatch.setattr(app_settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(app_settings, "openai_url", chat_url, raising=False)
+    monkeypatch.setattr(app_settings, "openai_text_model", "qwen-plus", raising=False)
+    monkeypatch.setattr("app.services.voice_expense.requests.post", fake_post)
+
+    parse_expense_draft("我和小王住宿花了 500，是我付的", members, owner_id)
+
+    payload = captured["payload"]
+    system_prompt = payload["messages"][0]["content"]
+    user_payload = json.loads(payload["messages"][1]["content"])
+
+    assert captured["url"] == chat_url
+    assert captured["headers"]["Authorization"] == "Bearer test-key"
+    assert payload["model"] == "qwen-plus"
+    assert payload["response_format"] == {"type": "json_object"}
+    assert user_payload["members"] == members
+    assert user_payload["current_user_id"] == owner_id
+    assert "members.name" in system_prompt
+    assert "临时成员" in system_prompt
+    assert "没说参与人" in system_prompt
+    assert "JSON" in system_prompt
+
+
+def test_voice_streaming_backend_has_chinese_diagnostic_logs():
+    root = Path(__file__).resolve().parents[1]
+    expenses_source = (root / "app" / "routers" / "expenses.py").read_text()
+    tencent_source = (root / "app" / "services" / "tencent_asr.py").read_text()
+
+    for message in [
+        "语音会话已连接",
+        "语音会话鉴权失败",
+        "语音会话已就绪",
+        "语音会话收到停止指令",
+        "语音会话识别完成",
+        "语音会话生成草稿成功",
+        "语音会话失败",
+    ]:
+        assert message in expenses_source
+
+    for message in [
+        "腾讯 ASR 开始连接",
+        "腾讯 ASR 已连接",
+        "腾讯 ASR 握手成功",
+        "腾讯 ASR 收到 final=1",
+        "腾讯 ASR 音频发送完成",
+        "腾讯 ASR 等待最终结果超时",
+    ]:
+        assert message in tencent_source
+
+
+def test_tencent_asr_signature_uses_websocket_url_without_protocol(monkeypatch):
+    """签名原文必须是不含 wss:// 的请求 URL，不能使用通用 API canonical request。"""
+    import urllib.parse
+
+    import app.services.tencent_asr as tencent_asr_mod
+
+    captured = {}
+
+    class FakeDigest:
+        def digest(self):
+            return b"signature-bytes"
+
+    def fake_hmac_new(key, message, digestmod):
+        captured["message"] = message.decode("utf-8")
+        return FakeDigest()
+
+    class FakeUUID:
+        int = 42
+
+    monkeypatch.setattr(tencent_asr_mod.time, "time", lambda: 1_700_000_000)
+    monkeypatch.setattr(tencent_asr_mod.uuid, "uuid4", lambda: FakeUUID())
+    monkeypatch.setattr(tencent_asr_mod.hmac, "new", fake_hmac_new)
+
+    url = tencent_asr_mod._sign_url(
+        endpoint="wss://asr.cloud.tencent.com/asr/v2/",
+        appid="1259220000",
+        secret_id="test-secret-id",
+        secret_key="test-secret-key",
+        engine_model_type="16k_zh",
+        voice_id="test-voice-id",
+        needvad=1,
+        vad_silence_time=800,
+        filter_modal=2,
+        filter_punc=0,
+        convert_num_mode=1,
+        hotword_list="小王|100",
     )
 
-    draft = create_voice_expense_draft(
-        audio=b"recording",
-        filename="voice.m4a",
-        content_type="audio/mp4",
-        members=members,
-        current_user_id=owner_id,
-    )
+    unsigned_url = url.split("&signature=", 1)[0].removeprefix("wss://")
+    assert captured["message"] == urllib.parse.unquote(unsigned_url)
+    assert "hotword_list=小王|100" in captured["message"]
+    assert "hotword_list=%E5%B0%8F%E7%8E%8B%7C100" in unsigned_url
+    assert not captured["message"].startswith("GET\n")
 
-    assert draft["category"] == "餐饮"
-    assert draft["note"] == "午饭"
-    assert draft["split_type"] == "exact"
-    assert draft["splits"] == [
-        {
-            "member_id": owner_member_id,
-            "user_id": owner_id,
-            "amount": Decimal("58.00"),
-        },
-        {
-            "member_id": friend_member_id,
-            "user_id": None,
-            "amount": Decimal("30.00"),
-        },
+
+def test_tencent_asr_hotword_list_uses_weight_by_name_type():
+    assert _build_hotword_list(
+        ["111", "陈皖琼", "Sylvia", "Stella", "陈皖琼", "带 空格", "超过十个汉字的成员名字甲乙丙"],
+        100,
+    ) == "陈皖琼|100,Sylvia|11,Stella|11"
+    assert _build_hotword_list(["陈皖琼", "Sylvia"], 10) == "陈皖琼|10,Sylvia|10"
+
+
+@pytest.mark.asyncio
+async def test_tencent_asr_stream_protocol(monkeypatch):
+    """腾讯实时 ASR 流程：
+      1. URL 带签名参数（HMAC-SHA1）连接 wss://...
+      2. 服务端先发 handshake {"code":0,"message":"success",...}
+      3. 客户端送 binary 音频帧
+      4. 服务端回 result 消息：slice_type=0/1 是 partial，slice_type=2 是 final
+      5. 客户端音频送完后发 {"type":"end"} 文本帧
+      6. 服务端发 {"final":1} 后关闭
+    """
+    class FakeTencentWebSocket:
+        def __init__(self, url, **kwargs):
+            self.url = url
+            self.kwargs = kwargs
+            self.sent_messages = []
+            self.recv_messages: asyncio.Queue = asyncio.Queue()
+            # 服务端响应序列：握手 → partial → final → final=1 结束
+            self.recv_messages.put_nowait(json_text({"code": 0, "message": "success", "voice_id": "v-1"}))
+            self.recv_messages.put_nowait(json_text({
+                "code": 0, "message": "success", "voice_id": "v-1",
+                "result": {
+                    "slice_type": 1, "index": 0, "start_time": 0, "end_time": 1200,
+                    "voice_text_str": "午饭", "word_size": 0, "word_list": [],
+                },
+            }))
+            self.recv_messages.put_nowait(json_text({
+                "code": 0, "message": "success", "voice_id": "v-1",
+                "result": {
+                    "slice_type": 2, "index": 0, "start_time": 0, "end_time": 2400,
+                    "voice_text_str": "午饭八十八元", "word_size": 0, "word_list": [],
+                },
+            }))
+            self.recv_messages.put_nowait(json_text({"code": 0, "message": "success", "final": 1}))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def send(self, message):
+            self.sent_messages.append(message)
+
+        async def recv(self):
+            return await self.recv_messages.get()
+
+        async def close(self):
+            pass
+
+    import app.services.tencent_asr as tencent_asr_mod
+    captured: dict = {}
+    def fake_connect(url, **kwargs):
+        ws = FakeTencentWebSocket(url, **kwargs)
+        captured["ws"] = ws
+        return ws
+    monkeypatch.setattr(tencent_asr_mod.websockets, "connect", fake_connect, raising=False)
+
+    monkeypatch.setattr(app_settings, "asr_appid", "12345", raising=False)
+    monkeypatch.setattr(app_settings, "asr_secret_id", "sid", raising=False)
+    monkeypatch.setattr(app_settings, "asr_secret_key", "skey", raising=False)
+    monkeypatch.setattr(app_settings, "asr_engine_model_type", "16k_zh", raising=False)
+    monkeypatch.setattr(app_settings, "asr_endpoint", "wss://asr.cloud.tencent.com/asr/v2/", raising=False)
+    monkeypatch.setattr(app_settings, "asr_needvad", 1, raising=False)
+    monkeypatch.setattr(app_settings, "asr_vad_silence_time", 800, raising=False)
+    monkeypatch.setattr(app_settings, "asr_filter_modal", 2, raising=False)
+    monkeypatch.setattr(app_settings, "asr_filter_punc", 0, raising=False)
+    monkeypatch.setattr(app_settings, "asr_convert_num_mode", 1, raising=False)
+    monkeypatch.setattr(app_settings, "asr_hotword_weight", 100, raising=False)
+    monkeypatch.setattr(app_settings, "asr_connect_timeout_seconds", 5, raising=False)
+    monkeypatch.setattr(app_settings, "asr_final_timeout_seconds", 5, raising=False)
+
+    async def chunks():
+        yield b"audio-one"
+        yield b"audio-two"
+
+    events = []
+    async for event in stream_tencent_asr(
+        chunks(), wav_name="ledger-id", session_id="test-session",
+        hotwords=["小王", "张三"],
+    ):
+        events.append(event)
+
+    ws = captured["ws"]
+    # 发送帧包含两段 audio binary + 末尾的 {"type":"end"} 文本帧
+    audio_frames = [m for m in ws.sent_messages if isinstance(m, (bytes, bytearray))]
+    assert b"audio-one" in audio_frames
+    assert b"audio-two" in audio_frames
+    end_msg = next(m for m in ws.sent_messages if isinstance(m, str) and "end" in m)
+    assert json.loads(end_msg) == {"type": "end"}
+    # 签名 URL 必须包含必要的鉴权参数和 hotword_list（包含我们传的人名）
+    assert "secretid=sid" in ws.url
+    assert "engine_model_type=16k_zh" in ws.url
+    assert "voice_format=1" in ws.url
+    assert "sample_rate=16000" in ws.url
+    assert "hotword_list=" in ws.url
+    # weight=100 表示同音字替换（人名场景）
+    assert "%E5%B0%8F%E7%8E%8B%7C100" in ws.url  # 小王|100 URL-encoded
+    # 事件顺序：partial → final
+    assert events == [
+        {"type": "partial", "text": "午饭", "is_final": False},
+        {"type": "final", "text": "午饭八十八元", "is_final": True},
     ]
+
+
+@pytest.mark.asyncio
+async def test_voice_receiver_accepts_start_control_message_without_unknown_warning(caplog):
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages = [
+                {
+                    "text": json_text({
+                        "type": "start",
+                        "audio": {
+                            "format": "pcm_s16le",
+                            "sample_rate": 16000,
+                            "channels": 1,
+                        },
+                    })
+                },
+                {"text": json_text({"type": "stop"})},
+            ]
+
+        async def receive(self):
+            return self.messages.pop(0)
+
+    caplog.set_level(logging.WARNING)
+    queue = asyncio.Queue()
+    stats = {"chunks": 0, "bytes": 0}
+
+    await _receive_voice_audio(
+        FakeWebSocket(),
+        queue,
+        session_id="test-session",
+        audio_stats=stats,
+    )
+
+    assert await queue.get() is None
+    assert "语音会话收到未知控制消息" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_tencent_asr_times_out_after_audio_end_without_final(monkeypatch):
+    """发送完 {"type":"end"} 后如果服务端一直不回 final=1，要超时收尾，不能挂死。"""
+    class HangingTencentWebSocket:
+        def __init__(self, *a, **kw):
+            self.sent_messages = []
+            self.handshake_sent = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def send(self, message):
+            self.sent_messages.append(message)
+
+        async def recv(self):
+            if not self.handshake_sent:
+                self.handshake_sent = True
+                return json_text({"code": 0, "message": "success", "voice_id": "v"})
+            await asyncio.sleep(3600)
+
+        async def close(self):
+            pass
+
+    import app.services.tencent_asr as tencent_asr_mod
+    monkeypatch.setattr(tencent_asr_mod.websockets, "connect",
+                        lambda *a, **kw: HangingTencentWebSocket(*a, **kw), raising=False)
+    monkeypatch.setattr(app_settings, "asr_appid", "123", raising=False)
+    monkeypatch.setattr(app_settings, "asr_secret_id", "sid", raising=False)
+    monkeypatch.setattr(app_settings, "asr_secret_key", "skey", raising=False)
+    monkeypatch.setattr(app_settings, "asr_engine_model_type", "16k_zh", raising=False)
+    monkeypatch.setattr(app_settings, "asr_endpoint", "wss://asr.example/asr/v2/", raising=False)
+    monkeypatch.setattr(app_settings, "asr_connect_timeout_seconds", 5, raising=False)
+    monkeypatch.setattr(app_settings, "asr_final_timeout_seconds", 0.05, raising=False)
+    monkeypatch.setattr(app_settings, "asr_needvad", 1, raising=False)
+    monkeypatch.setattr(app_settings, "asr_vad_silence_time", 800, raising=False)
+    monkeypatch.setattr(app_settings, "asr_filter_modal", 0, raising=False)
+    monkeypatch.setattr(app_settings, "asr_filter_punc", 0, raising=False)
+    monkeypatch.setattr(app_settings, "asr_convert_num_mode", 1, raising=False)
+    monkeypatch.setattr(app_settings, "asr_hotword_weight", 10, raising=False)
+
+    async def chunks():
+        yield b"audio"
+
+    async def collect_stream():
+        async for _ in stream_tencent_asr(chunks(), wav_name="test", session_id="test-session"):
+            pass
+
+    # 不抛异常（超时后优雅结束，而不是报错），0.5s 内能跑完
+    await asyncio.wait_for(collect_stream(), timeout=0.5)
+
+
+def json_text(payload):
+    import json
+
+    return json.dumps(payload)
 
 
 def assert_http_error(exc_info, status_code):
