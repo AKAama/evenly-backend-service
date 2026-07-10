@@ -39,30 +39,61 @@ Authentication should use the same session cookie as the rest of the API. If a
 native client cannot rely on cookies, pass a short-lived bearer token through
 the `Authorization` header during the WebSocket handshake.
 
-## Cloud FunASR Configuration
+## Tencent Cloud ASR Configuration
 
-The backend connects to the cloud FunASR WebSocket endpoint. iOS should never
-connect to FunASR directly.
+The backend connects to Tencent Cloud's realtime ASR WebSocket endpoint. iOS
+connects only to the Evenly backend. Put local credentials in
+`config/config.yaml`; protocol defaults live in `config/config.defaults.yaml`.
 
 Required:
 
-```text
-FUNASR_WEBSOCKET_URL=wss://your-funasr-provider.example/ws
+```yaml
+asr_appid: "your-app-id"
+asr_secret_id: "your-secret-id"
+asr_secret_key: "your-secret-key"
 ```
 
 Optional:
 
-```text
-FUNASR_AUTH_HEADER=Authorization
-FUNASR_AUTH_TOKEN=Bearer your-token
-FUNASR_MODE=2pass
-FUNASR_CHUNK_SIZE=5,10,5
-FUNASR_CHUNK_INTERVAL=10
-FUNASR_ITN=true
+```yaml
+asr_engine_model_type: 16k_zh
+asr_endpoint: wss://asr.cloud.tencent.com/asr/v2/
+asr_needvad: 1
+asr_vad_silence_time: 800
+asr_filter_modal: 2
+asr_filter_punc: 0
+asr_convert_num_mode: 1
+asr_hotword_weight: 100
+asr_connect_timeout_seconds: 10
+asr_final_timeout_seconds: 5
 ```
 
-If the provider uses a custom header such as `X-API-Key`, set
-`FUNASR_AUTH_HEADER=X-API-Key` and put the secret in `FUNASR_AUTH_TOKEN`.
+The backend signs the Tencent WebSocket URL, forwards binary 16 kHz mono PCM,
+and sends `{"type":"end"}` after the client stops. Active ledger member names
+are included as request-scoped temporary hotwords: Chinese names use enhanced
+homophone replacement and non-Chinese names use super-hotword weighting.
+
+## Draft Parsing Configuration
+
+The backend parses the final transcript with an OpenAI-compatible Chat
+Completions endpoint configured in `config/config.yaml`:
+
+```yaml
+openai_url: https://api.openai.com/v1/chat/completions
+openai_api_key: your-api-key
+openai_text_model: gpt-4o-mini
+```
+
+Equivalent environment variables are also supported:
+
+```bash
+export OPENAI_URL="https://api.openai.com/v1/chat/completions"
+export OPENAI_API_KEY="your-api-key"
+export OPENAI_TEXT_MODEL="gpt-4o-mini"
+```
+
+The backend sends Chat Completions messages with JSON mode and validates member
+IDs, payer selection, amount, and participants before returning a draft.
 
 ## Client Events
 

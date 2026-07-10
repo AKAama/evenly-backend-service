@@ -8,7 +8,9 @@ Edit the local config file first:
 config/config.yaml
 ```
 
-This file is ignored by Git and is the main local runtime config.
+This file is ignored by Git and only needs the values you want to override.
+Committed defaults live in `config/config.defaults.yaml`; environment variables
+override both YAML files.
 
 Start PostgreSQL and Redis:
 
@@ -39,14 +41,19 @@ make dev-api
 
 The API listens on `http://localhost:8000`.
 
-To enable voice expense drafts, keep the OpenAI key on the backend:
+To enable voice expense drafts, keep Tencent ASR credentials and the
+OpenAI-compatible text-model key on the backend:
 
 ```bash
-export OPENAI_API_KEY="your-key"
+export ASR_APPID="your-tencent-app-id"
+export ASR_SECRET_ID="your-tencent-secret-id"
+export ASR_SECRET_KEY="your-tencent-secret-key"
+export OPENAI_API_KEY="your-text-model-key"
 ```
 
-The default transcription and text models can be overridden with
-`OPENAI_TRANSCRIPTION_MODEL` and `OPENAI_TEXT_MODEL`.
+The default transcription and text models live in `config/config.defaults.yaml`
+and can be overridden in `config/config.yaml` or with `OPENAI_TRANSCRIPTION_MODEL`
+and `OPENAI_TEXT_MODEL`.
 
 ## Check common startup issues
 

@@ -72,12 +72,6 @@ class ConfirmExpenseRequest(BaseModel):
     status: str  # 'confirmed' or 'rejected'
 
 
-class VoiceExpenseSplitDraft(BaseModel):
-    member_id: UUID
-    user_id: UUID | None = None
-    amount: Decimal
-
-
 class VoiceExpenseDraft(BaseModel):
     transcript: str
     title: str
@@ -89,8 +83,7 @@ class VoiceExpenseDraft(BaseModel):
     expense_date: date = Field(default_factory=date.today)
     payer_user_id: UUID
     participant_member_ids: list[UUID]
-    split_type: str = "equal"
-    splits: list[VoiceExpenseSplitDraft] = Field(default_factory=list)
+    splits: list[dict] = Field(default_factory=list)
     confidence: float | None = None
     missing_fields: list[str] = Field(default_factory=list)
     confirmation_text: str
