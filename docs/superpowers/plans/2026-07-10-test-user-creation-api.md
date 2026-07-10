@@ -28,7 +28,7 @@
 
 **Interfaces:**
 - Consumes: `settings.test_admin_token`, `get_db()`, `get_user_by_email()`, `get_user_by_username()`, and `create_user()`.
-- Produces: `POST /test/users`, JSON model `TestUserCreate`, and header dependency `require_test_admin_token()`.
+- Produces: `POST /test/users`, JSON model `CreateTestUserRequest`, and header dependency `require_test_admin_token()`.
 
 - [ ] **Step 1: Write failing endpoint tests**
 
@@ -59,7 +59,7 @@ This preserves YAML field-name loading and enables the environment variable thro
 Create `app/routers/test_users.py` containing:
 
 ```python
-class TestUserCreate(BaseModel):
+class CreateTestUserRequest(BaseModel):
     email: EmailStr
     username: str = Field(min_length=3, max_length=30, pattern=r"^[A-Za-z][A-Za-z0-9_]{2,29}$")
     password: str = Field(min_length=6)

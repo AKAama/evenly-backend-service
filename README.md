@@ -111,6 +111,9 @@ cors:
   `openai_api_key` / `OPENAI_API_KEY`。模型和协议默认值在
   `config/config.defaults.yaml` 中，可通过 YAML 或环境变量覆盖。
 - **COS / SMTP**：在 YAML 中补充 `cos` / `smtp` 段即可启用头像上传与邮件发送。
+- **测试用户创建接口**：仅本地测试时可在被 Git 忽略的 `config/config.yaml` 中配置
+  `test_admin_token`。未配置时 `/test/users` 返回 `404`，不要将真实 Token 提交到仓库
+  或放入前端配置。
 - **生产部署**：务必覆盖 `jwt_secret_key`，并将 `auth_cookie_secure` 设为 `true`。
 
 ## API 概览
@@ -119,6 +122,7 @@ cors:
 | --- | --- |
 | `/auth` | 验证码发送 / 校验、注册、登录、Apple 登录、登出、密码重置 |
 | `/users` | 当前用户信息、认证方式、用户名 / 头像 / 邮箱 / 密码管理、用户搜索、注销 |
+| `/test/users` | 使用服务端测试 Token 创建无需邮箱验证码的测试用户（默认禁用） |
 | `/ledgers` | 账本 CRUD、成员管理、邀请接受 / 拒绝、账本概览 |
 | `/expenses` | 语音草稿、费用创建 / 查询 / 确认 / 拒绝 / 删除 |
 | `/ledgers/{id}/settlements` | 结算建议、历史记录、登记还款 |
@@ -128,6 +132,29 @@ cors:
 - `GET /` — 欢迎信息
 - `GET /health` — 存活检查
 - `GET /ready` — 就绪检查（含数据库连通性）
+
+### 使用 Apifox 创建测试用户
+
+先在本地 `config/config.yaml` 配置一个足够长的随机 Token，并重启后端：
+
+```yaml
+test_admin_token: "replace-with-a-long-random-secret"
+```
+
+然后发送 `POST /test/users`，Header 为
+`X-Test-Admin-Token: replace-with-a-long-random-secret`，JSON 请求体示例：
+
+```json
+{
+  "email": "test001@example.com",
+  "username": "test001",
+  "password": "secret123",
+  "display_name": "测试用户"
+}
+```
+
+接口返回新用户资料，但不会生成登录 Token 或写入登录 Cookie。新用户可使用邮箱或用户名
+和上述密码调用正常登录接口。也可以通过环境变量 `TEST_ADMIN_TOKEN` 提供服务端 Token。
 
 ## 数据库迁移
 

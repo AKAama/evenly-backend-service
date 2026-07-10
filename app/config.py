@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     verification_code_expire_seconds: int
     verification_send_interval_seconds: int
 
+    # Opt-in, server-side token for local test-only endpoints.
+    test_admin_token: Optional[str] = Field(default=None, validation_alias="TEST_ADMIN_TOKEN")
+
     # JWT
     jwt_secret_key: str
     jwt_expire_minutes: int
