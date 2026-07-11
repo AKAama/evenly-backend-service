@@ -54,7 +54,7 @@ jobs:
             # Verify that the new image understands the database's current
             # revision, then migrate before replacing the live container.
             docker run --rm \
-              -v /opt/evenly-backend-service/config/config.yaml:/app/config/config.yaml:ro \
+              -v /opt/evenly-backend-service/config:/app/config:ro \
               "$IMAGE" \
               sh -c 'cd /app && python -m alembic current && python -m alembic upgrade head'
 
@@ -62,7 +62,7 @@ jobs:
             docker rm evenly-backend-service || true
             docker run -d --name evenly-backend-service --restart unless-stopped \
               -p 8000:8000 \
-              -v /opt/evenly-backend-service/config/config.yaml:/app/config/config.yaml:ro \
+              -v /opt/evenly-backend-service/config:/app/config:ro \
               "$IMAGE"
             sleep 4
             curl -sf -o /dev/null http://127.0.0.1:8000/ready

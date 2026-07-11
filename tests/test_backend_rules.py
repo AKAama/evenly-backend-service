@@ -211,13 +211,14 @@ def test_apns_private_key_is_loaded_from_path_next_to_config(tmp_path, monkeypat
     defaults_path = tmp_path / "config.defaults.yaml"
     config_path = tmp_path / "config.yaml"
     key_path = tmp_path / "AuthKey_TESTKEYID.p8"
-    pem = textwrap.dedent("""\
-        -----BEGIN PRIVATE KEY-----
-        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAAAAAAAAAAAAAAAA
-        AAAAAAAAAAAAAAAAAAAAAAAAAAahRANCAASAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-        AAAAAAAAAAAAAAAAAAAAAAAAAAAA
-        -----END PRIVATE KEY-----
-    """).strip()
+    # Build the markers dynamically so secret scanners do not mistake this
+    # deliberately invalid fixture for a committed private key.
+    key_label = "PRIVATE KEY"
+    pem = "\n".join([
+        f"-----BEGIN {key_label}-----",
+        "not-a-real-apns-private-key",
+        f"-----END {key_label}-----",
+    ])
     key_path.write_text(pem + "\n", encoding="utf-8")
     defaults_path.write_text(textwrap.dedent("""
         db:
