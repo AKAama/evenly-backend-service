@@ -1,6 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 from pydantic import BaseModel, EmailStr, ConfigDict, Field
+from typing import Literal
 
 
 # User schemas
@@ -81,3 +82,8 @@ class PasswordReset(BaseModel):
     email: EmailStr
     code: str
     new_password: str = Field(min_length=6)
+
+
+class PushDeviceRegistration(BaseModel):
+    environment: Literal["sandbox", "production"]
+    bundle_id: str = Field(min_length=1, max_length=255)

@@ -39,6 +39,23 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    push_devices = relationship("PushDevice", back_populates="user", cascade="all, delete-orphan")
+
+
+class PushDevice(Base):
+    __tablename__ = "push_devices"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token = Column(String(200), unique=True, nullable=False, index=True)
+    environment = Column(String(20), nullable=False)
+    bundle_id = Column(String(255), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    last_seen_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="push_devices")
 
 
 class AuthIdentity(Base):

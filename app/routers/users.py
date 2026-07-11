@@ -1,4 +1,5 @@
 from uuid import UUID
+from datetime import datetime
 import logging
 import re
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
@@ -15,6 +16,7 @@ from app.models import (
     ExpenseConfirmation,
     Settlement,
     AuthIdentity,
+    PushDevice,
 )
 from app.schemas.user import (
     AuthMethodsResponse,
@@ -25,6 +27,7 @@ from app.schemas.user import (
     UsernameUpdate,
     UserResponse,
     UserUpdate,
+    PushDeviceRegistration,
 )
 from app.utils.deps import get_current_user
 from app.services.cos import get_cos_service
@@ -41,6 +44,44 @@ from app.config import settings
 
 router = APIRouter(prefix="/users", tags=["users"])
 logger = logging.getLogger(__name__)
+PUSH_TOKEN_PATTERN = re.compile(r"^[0-9a-fA-F]{64,200}$")
+
+
+@router.put("/me/push-devices/{token}", status_code=status.HTTP_204_NO_CONTENT)
+def register_push_device(
+    token: str,
+    request: PushDeviceRegistration,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not PUSH_TOKEN_PATTERN.fullmatch(token):
+        raise HTTPException(status_code=422, detail="Invalid APNs device token")
+    normalized = token.lower()
+    device = db.query(PushDevice).filter(PushDevice.token == normalized).first()
+    if device is None:
+        device = PushDevice(token=normalized, user_id=current_user.id)
+        db.add(device)
+    device.user_id = current_user.id
+    device.environment = request.environment
+    device.bundle_id = request.bundle_id
+    device.is_active = True
+    device.last_seen_at = datetime.utcnow()
+    db.commit()
+
+
+@router.delete("/me/push-devices/{token}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_push_device(
+    token: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    device = db.query(PushDevice).filter(
+        PushDevice.token == token.lower(),
+        PushDevice.user_id == current_user.id,
+    ).first()
+    if device is not None:
+        device.is_active = False
+        db.commit()
 
 
 @router.get("/me", response_model=UserResponse)

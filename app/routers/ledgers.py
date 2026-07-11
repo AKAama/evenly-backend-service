@@ -36,6 +36,7 @@ from app.schemas.expense import (
 from app.schemas.settlement import SettlementInstruction
 from app.schemas.user import UserResponse
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
+from app.services.push import PushEvent, build_payload, send_push_safely
 
 router = APIRouter(prefix="/ledgers", tags=["ledgers"])
 logger = logging.getLogger(__name__)
@@ -601,6 +602,13 @@ def add_member(
     db.commit()
     db.refresh(member)
     logger.info("Invited regular member ledger_id=%s member_id=%s user_id=%s", ledger_id, member.id, request.user_id)
+
+    send_push_safely(db, [request.user_id], build_payload(
+        event=PushEvent.LEDGER_INVITED,
+        actor_name=current_user.display_name or current_user.username,
+        ledger_name=ledger.name,
+        ledger_id=str(ledger_id),
+    ))
 
     return MemberResponse(
         id=member.id,

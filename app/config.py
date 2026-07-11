@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     auth_cookie_samesite: str
     apple_client_id: str
 
+    # Apple Push Notification service. Push is disabled when credentials are absent.
+    apns_team_id: Optional[str] = Field(default=None, validation_alias="APNS_TEAM_ID")
+    apns_key_id: Optional[str] = Field(default=None, validation_alias="APNS_KEY_ID")
+    apns_private_key: Optional[str] = Field(default=None, validation_alias="APNS_PRIVATE_KEY")
+    apns_bundle_id: str = Field(default="com.yhma.Evenly", validation_alias="APNS_BUNDLE_ID")
+
     # OpenAI-backed voice expense drafts. The key is server-side only.
     openai_api_key: Optional[str] = Field(default=None, validation_alias=AliasChoices("OPENAI_API_KEY", "DASHSCOPE_API_KEY"))
     openai_transcription_model: str

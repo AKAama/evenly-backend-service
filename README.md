@@ -170,6 +170,19 @@ make db-revision m="描述变更"    # 生成新迁移
 `uv run python -m alembic stamp head` 标记为已管理，再进行后续迁移。
 生产环境执行迁移前务必备份数据。详见 [`DATABASE.md`](DATABASE.md)。
 
+## APNs 推送配置
+
+推送使用 Apple APNs Token Authentication。生产环境通过密钥管理系统设置：
+
+```bash
+APNS_TEAM_ID=你的AppleTeamID
+APNS_KEY_ID=你的APNsKeyID
+APNS_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----'
+APNS_BUNDLE_ID=com.yhma.Evenly
+```
+
+未配置前三项时服务会安全跳过推送，不影响账单、邀请或确认接口。部署包含推送功能的版本前，先执行 `make db-upgrade` 创建 `push_devices` 表。开发签名设备使用 sandbox APNs；TestFlight 与 App Store 构建使用 production APNs。私钥不得写入仓库或镜像。
+
 ## 测试
 
 ```bash

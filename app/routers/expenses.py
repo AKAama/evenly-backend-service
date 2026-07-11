@@ -29,6 +29,7 @@ from app.services.voice_expense import (
     create_voice_expense_draft,
     create_voice_expense_draft_from_transcript,
 )
+from app.services.push import PushEvent, build_payload, send_push_safely
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
@@ -392,7 +393,7 @@ def create_expense(
 ):
     """Create a new expense in a ledger"""
     # Check if ledger exists and user is a member
-    get_ledger_or_404(db, ledger_id)
+    ledger = get_ledger_or_404(db, ledger_id)
     require_ledger_member(db, ledger_id, current_user)
 
     if expense.total_amount <= 0:
@@ -492,6 +493,17 @@ def create_expense(
 
     db.commit()
     db.refresh(db_expense)
+
+    recipients = registered_participant_ids - {current_user.id}
+    if recipients:
+        send_push_safely(db, recipients, build_payload(
+            event=PushEvent.EXPENSE_CREATED,
+            actor_name=current_user.display_name or current_user.username,
+            ledger_name=ledger.name,
+            ledger_id=str(ledger_id),
+            expense_name=db_expense.title,
+            expense_id=str(db_expense.id),
+        ))
 
     return db_expense
 
@@ -640,6 +652,18 @@ def confirm_expense(
 
     db.commit()
     db.refresh(expense)
+
+    if expense.created_by != current_user.id:
+        ledger = get_ledger_or_404(db, expense.ledger_id)
+        event = PushEvent.EXPENSE_CONFIRMED if request.status == "confirmed" else PushEvent.EXPENSE_REJECTED
+        send_push_safely(db, [expense.created_by], build_payload(
+            event=event,
+            actor_name=current_user.display_name or current_user.username,
+            ledger_name=ledger.name,
+            ledger_id=str(expense.ledger_id),
+            expense_name=expense.title,
+            expense_id=str(expense.id),
+        ))
 
     return expense
 
