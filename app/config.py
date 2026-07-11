@@ -88,7 +88,10 @@ class Settings(BaseSettings):
     # Apple Push Notification service. Push is disabled when credentials are absent.
     apns_team_id: Optional[str] = Field(default=None, validation_alias="APNS_TEAM_ID")
     apns_key_id: Optional[str] = Field(default=None, validation_alias="APNS_KEY_ID")
+    # Resolved PEM content. Prefer setting apns_private_key_path (or a filename in
+    # apns_private_key) so the .p8 stays as a sibling of config.yaml.
     apns_private_key: Optional[str] = Field(default=None, validation_alias="APNS_PRIVATE_KEY")
+    apns_private_key_path: Optional[str] = Field(default=None, validation_alias="APNS_PRIVATE_KEY_PATH")
     apns_bundle_id: str = Field(default="com.yhma.Evenly", validation_alias="APNS_BUNDLE_ID")
 
     # OpenAI-backed voice expense drafts. The key is server-side only.
@@ -153,6 +156,11 @@ _YAML_ALIASES = {
     "ASR_HOTWORD_WEIGHT": "asr_hotword_weight",
     "ASR_CONNECT_TIMEOUT_SECONDS": "asr_connect_timeout_seconds",
     "ASR_FINAL_TIMEOUT_SECONDS": "asr_final_timeout_seconds",
+    "APNS_TEAM_ID": "apns_team_id",
+    "APNS_KEY_ID": "apns_key_id",
+    "APNS_PRIVATE_KEY": "apns_private_key",
+    "APNS_PRIVATE_KEY_PATH": "apns_private_key_path",
+    "APNS_BUNDLE_ID": "apns_bundle_id",
 }
 
 
@@ -184,14 +192,100 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
+def _looks_like_pem_private_key(value: str) -> bool:
+    return "BEGIN PRIVATE KEY" in value or "BEGIN EC PRIVATE KEY" in value
+
+
+def _resolve_path(path_value: str, config_dir: Path) -> Path:
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        return path
+    # Prefer relative-to-config-dir (where config.yaml and AuthKey_*.p8 live).
+    candidate = config_dir / path
+    if candidate.exists():
+        return candidate
+    # Fall back to CWD-relative paths for local tooling.
+    return path
+
+
+def _resolve_apns_private_key(merged: dict[str, Any], config_dir: Path) -> dict[str, Any]:
+    """Load APNs .p8 content from a path sibling to config.yaml when needed.
+
+    Resolution order:
+    1. Inline PEM in apns_private_key / APNS_PRIVATE_KEY
+    2. Explicit apns_private_key_path / APNS_PRIVATE_KEY_PATH
+    3. apns_private_key value treated as a filename/path (e.g. AuthKey_xxx.p8)
+    """
+    resolved = dict(merged)
+    inline = resolved.get("apns_private_key")
+    if isinstance(inline, str) and inline.strip() and _looks_like_pem_private_key(inline):
+        resolved["apns_private_key"] = inline.replace("\\n", "\n").strip()
+        return resolved
+
+    path_value = resolved.get("apns_private_key_path")
+    if not path_value and isinstance(inline, str) and inline.strip():
+        path_value = inline.strip()
+
+    if not path_value:
+        # Empty yaml key (null/"") should not keep a falsey placeholder.
+        if "apns_private_key" in resolved and not resolved.get("apns_private_key"):
+            resolved["apns_private_key"] = None
+        return resolved
+
+    key_path = _resolve_path(str(path_value), config_dir)
+    if not key_path.is_file():
+        raise FileNotFoundError(
+            f"APNs private key file not found: {key_path} "
+            f"(set apns_private_key_path next to config.yaml)"
+        )
+    resolved["apns_private_key"] = key_path.read_text(encoding="utf-8").strip()
+    resolved["apns_private_key_path"] = str(key_path)
+    return resolved
+
+
+def _finalize_apns_private_key(loaded: Settings, config_dir: Path) -> Settings:
+    """Ensure apns_private_key holds PEM content after env/yaml merge."""
+    current = loaded.apns_private_key
+    if isinstance(current, str) and current.strip() and _looks_like_pem_private_key(current):
+        normalized = current.replace("\\n", "\n").strip()
+        if normalized == current:
+            return loaded
+        return loaded.model_copy(update={"apns_private_key": normalized})
+
+    path_value = loaded.apns_private_key_path
+    if not path_value and isinstance(current, str) and current.strip():
+        path_value = current.strip()
+    if not path_value:
+        if current in ("", None):
+            return loaded.model_copy(update={"apns_private_key": None})
+        return loaded
+
+    key_path = _resolve_path(path_value, config_dir)
+    if not key_path.is_file():
+        raise FileNotFoundError(
+            f"APNs private key file not found: {key_path} "
+            f"(set apns_private_key_path next to config.yaml)"
+        )
+    return loaded.model_copy(
+        update={
+            "apns_private_key": key_path.read_text(encoding="utf-8").strip(),
+            "apns_private_key_path": str(key_path),
+        }
+    )
+
+
 def load_settings(
     config_path: Optional[Path] = None,
     defaults_path: Optional[Path] = None,
 ) -> Settings:
     config_dir = Path(__file__).parent.parent / "config"
+    resolved_config_path = config_path or config_dir / "config.yaml"
+    # Paths like AuthKey_*.p8 are resolved relative to the directory that holds config.yaml.
+    key_base_dir = resolved_config_path.parent if resolved_config_path else config_dir
     defaults = _read_yaml_config(defaults_path or config_dir / "config.defaults.yaml")
-    local = _read_yaml_config(config_path or config_dir / "config.yaml")
-    return Settings(**_deep_merge(defaults, local))
+    local = _read_yaml_config(resolved_config_path)
+    merged = _resolve_apns_private_key(_deep_merge(defaults, local), key_base_dir)
+    return _finalize_apns_private_key(Settings(**merged), key_base_dir)
 
 
 settings = load_settings()

@@ -40,6 +40,7 @@ from app.services.auth import (
     verify_password,
 )
 from app.services.verification import send_verification_code, verify_code
+from app.services.rate_limit import enforce_rate_limit
 from app.config import settings
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -200,6 +201,12 @@ def search_users(
     current_user: User = Depends(get_current_user)
 ):
     """Search users by email or display name"""
+    enforce_rate_limit(
+        f"search:user:{current_user.id}",
+        limit=60,
+        window_seconds=60,
+        detail="搜索过于频繁，请稍后重试",
+    )
     # Search by email, username, or display_name (case insensitive)
     query = db.query(User).filter(
         (User.email.ilike(f"%{q}%")) |
@@ -260,6 +267,12 @@ def send_password_setup_code(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    enforce_rate_limit(
+        f"send_code:user:{current_user.id}",
+        limit=10,
+        window_seconds=3600,
+        detail="发送过于频繁，请稍后重试",
+    )
     if get_password_identity(db, current_user.id):
         raise HTTPException(status_code=400, detail="账号已经设置密码")
     if not send_verification_code(current_user.email, purpose="password_setup"):
@@ -288,6 +301,12 @@ def send_email_change_code(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    enforce_rate_limit(
+        f"send_code:user:{current_user.id}",
+        limit=10,
+        window_seconds=3600,
+        detail="发送过于频繁，请稍后重试",
+    )
     new_email = str(request.new_email).strip().lower()
     if new_email == current_user.email.lower():
         raise HTTPException(status_code=400, detail="新邮箱不能与当前邮箱相同")

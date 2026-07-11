@@ -101,6 +101,43 @@ class ExpenseWithDetails(ExpenseResponse):
     confirmations: list[ExpenseConfirmationResponse] = []
 
 
+def expense_to_with_details(
+    expense,
+    *,
+    status: str | None = None,
+    payer=None,
+    splits=None,
+    confirmations=None,
+) -> ExpenseWithDetails:
+    """Build list/detail payload from an Expense ORM row.
+
+    Manual constructors historically omitted category/icon fields, so the app
+    always fell back to the default ¥ icon even when icons were persisted.
+    """
+    base = ExpenseResponse.model_validate(expense).model_dump()
+    if status is not None:
+        base["status"] = status
+
+    payer_obj = payer if payer is not None else expense.payer
+    split_src = splits if splits is not None else expense.splits
+    conf_src = confirmations if confirmations is not None else expense.confirmations
+
+    return ExpenseWithDetails(
+        **base,
+        payer=UserResponse.model_validate(payer_obj),
+        splits=[
+            s if isinstance(s, ExpenseSplitResponse) else ExpenseSplitResponse.model_validate(s)
+            for s in split_src
+        ],
+        confirmations=[
+            c
+            if isinstance(c, ExpenseConfirmationResponse)
+            else ExpenseConfirmationResponse.model_validate(c)
+            for c in conf_src
+        ],
+    )
+
+
 class ConfirmExpenseRequest(BaseModel):
     status: str  # 'confirmed' or 'rejected'
 

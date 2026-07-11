@@ -86,11 +86,19 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    from app.services.redis_client import redis_status
+
+    redis = redis_status()
+    return {
+        "status": "healthy",
+        "redis": redis,
+    }
 
 
 @app.get("/ready")
 async def readiness_check():
+    from app.services.redis_client import redis_status
+
     try:
         with engine.connect() as connection:
             connection.execute(text("select 1"))
@@ -98,7 +106,13 @@ async def readiness_check():
         logger.exception("Database readiness check failed", exc_info=exc)
         raise HTTPException(status_code=503, detail="Database is not ready") from exc
 
-    return {"status": "ready"}
+    redis = redis_status()
+    # Redis is optional: app is ready without it, but surface status for ops.
+    return {
+        "status": "ready",
+        "database": "ok",
+        "redis": redis,
+    }
 
 
 if __name__ == "__main__":

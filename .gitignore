@@ -37,6 +37,9 @@ env/
 .env
 .env.local
 config/config.yaml
+# APNs auth keys (keep next to config.yaml; never commit)
+config/*.p8
+config/AuthKey_*.p8
 
 # Database
 *.db

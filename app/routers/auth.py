@@ -3,7 +3,7 @@ import re
 import secrets
 import hashlib
 from datetime import timedelta
-from fastapi import APIRouter, Depends, HTTPException, Response, status, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, UploadFile, File, Form
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from typing import Annotated
@@ -15,6 +15,7 @@ from app.schemas.user import AppleLoginRequest, UserCreate, UserResponse, Token,
 from app.services.auth import create_user, authenticate_user, create_access_token, get_password_hash, get_user_by_email, get_user_by_username, set_password
 from app.services.apple_auth import AppleTokenError, verify_apple_identity_token
 from app.services.cos import get_cos_service
+from app.services.rate_limit import client_ip, enforce_rate_limit
 from app.services.verification import send_verification_code, verify_code
 from app.config import settings
 
@@ -61,8 +62,16 @@ def clear_auth_cookie(response: Response) -> None:
 
 
 @router.post("/send-verification")
-def send_verification(email: str, db: Session = Depends(get_db)):
+def send_verification(email: str, request: Request, db: Session = Depends(get_db)):
     """发送邮箱验证码"""
+    ip = client_ip(request)
+    enforce_rate_limit(f"send_code:ip:{ip}", limit=30, window_seconds=3600)
+    enforce_rate_limit(
+        f"send_code:email:{email.strip().lower()}",
+        limit=10,
+        window_seconds=3600,
+        detail="发送过于频繁，请稍后重试",
+    )
     # 检查邮箱是否已被注册
     existing_user = get_user_by_email(db, email)
     if existing_user:
@@ -196,10 +205,21 @@ async def register(
 
 @router.post("/login", response_model=Token)
 def login(
+    request: Request,
     response: Response,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
+    ip = client_ip(request)
+    identifier = (form_data.username or "").strip().lower()
+    enforce_rate_limit(f"login:ip:{ip}", limit=20, window_seconds=600)
+    if identifier:
+        enforce_rate_limit(
+            f"login:id:{identifier}",
+            limit=10,
+            window_seconds=600,
+            detail="登录尝试过多，请稍后重试",
+        )
     # Use form_data.username as email
     user = authenticate_user(db, type("UserLogin", (), {"identifier": form_data.username, "password": form_data.password})())
 
@@ -223,8 +243,11 @@ def login(
 def login_with_apple(
     request: AppleLoginRequest,
     response: Response,
+    http_request: Request,
     db: Session = Depends(get_db),
 ):
+    ip = client_ip(http_request)
+    enforce_rate_limit(f"login:apple:ip:{ip}", limit=30, window_seconds=600)
     try:
         claims = verify_apple_identity_token(request.identity_token, request.nonce)
     except AppleTokenError as exc:
@@ -287,7 +310,13 @@ def logout(response: Response):
 
 
 @router.post("/password-reset/send")
-def send_password_reset_code(request: SendCodeRequest, db: Session = Depends(get_db)):
+def send_password_reset_code(
+    request: SendCodeRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+):
+    ip = client_ip(http_request)
+    enforce_rate_limit(f"send_code:ip:{ip}", limit=30, window_seconds=3600)
     # Always return the same response to avoid revealing registered emails.
     if get_user_by_email(db, request.email):
         if not send_verification_code(request.email, purpose="password_reset"):

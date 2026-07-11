@@ -28,15 +28,12 @@ from app.schemas.ledger import (
     LedgerMemberWithUser,
     LedgerOverviewResponse,
 )
-from app.schemas.expense import (
-    ExpenseConfirmationResponse,
-    ExpenseSplitResponse,
-    ExpenseWithDetails,
-)
+from app.schemas.expense import expense_to_with_details
 from app.schemas.settlement import SettlementInstruction
 from app.schemas.user import UserResponse
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 from app.services.push import PushEvent, build_payload, send_push_safely
+from app.services import invitation_cache
 
 router = APIRouter(prefix="/ledgers", tags=["ledgers"])
 logger = logging.getLogger(__name__)
@@ -86,6 +83,7 @@ def create_ledger(
 
     # Add initial members from request (if any)
     member_responses = []
+    invited_user_ids: list[UUID] = []
     for member_data in ledger.members:
         # Handle temporary members
         if member_data.is_temporary:
@@ -112,6 +110,7 @@ def create_ledger(
                 user_id=member_data.user_id,
                 status="pending",
             )
+            invited_user_ids.append(member_data.user_id)
         
         db.add(member)
         db.commit()
@@ -131,6 +130,15 @@ def create_ledger(
         ))
 
     db.commit()
+
+    if invited_user_ids:
+        invitation_cache.invalidate_pending_invitations_many(invited_user_ids)
+        send_push_safely(db, invited_user_ids, build_payload(
+            event=PushEvent.LEDGER_INVITED,
+            actor_name=current_user.display_name or current_user.username,
+            ledger_name=db_ledger.name,
+            ledger_id=str(db_ledger.id),
+        ))
 
     # Build response with all members including owner
     owner_user_response = UserResponse.model_validate(current_user)
@@ -206,6 +214,10 @@ def get_pending_invitations(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    cached = invitation_cache.get_pending_invitations(current_user.id)
+    if cached is not None:
+        return [LedgerInvitationResponse.model_validate(item) for item in cached]
+
     rows = (
         db.query(LedgerMember, Ledger, User)
         .join(Ledger, Ledger.id == LedgerMember.ledger_id)
@@ -216,7 +228,7 @@ def get_pending_invitations(
         )
         .all()
     )
-    return [
+    invitations = [
         LedgerInvitationResponse(
             id=membership.id,
             ledger_id=ledger.id,
@@ -226,6 +238,11 @@ def get_pending_invitations(
         )
         for membership, ledger, inviter in rows
     ]
+    invitation_cache.set_pending_invitations(
+        current_user.id,
+        [item.model_dump(mode="json") for item in invitations],
+    )
+    return invitations
 
 
 @router.post("/invitations/{invitation_id}/accept", status_code=status.HTTP_204_NO_CONTENT)
@@ -243,6 +260,7 @@ def accept_invitation(
         raise HTTPException(status_code=404, detail="Invitation not found")
     invitation.status = "active"
     db.commit()
+    invitation_cache.invalidate_pending_invitations(current_user.id)
 
 
 @router.post("/invitations/{invitation_id}/reject", status_code=status.HTTP_204_NO_CONTENT)
@@ -251,6 +269,7 @@ def reject_invitation(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Reject a pending invitation while retaining the membership row for history/re-invite."""
     invitation = db.query(LedgerMember).filter(
         LedgerMember.id == invitation_id,
         LedgerMember.user_id == current_user.id,
@@ -258,8 +277,9 @@ def reject_invitation(
     ).first()
     if not invitation:
         raise HTTPException(status_code=404, detail="Invitation not found")
-    db.delete(invitation)
+    invitation.status = "rejected"
     db.commit()
+    invitation_cache.invalidate_pending_invitations(current_user.id)
 
 
 @router.get("/{ledger_id}", response_model=LedgerWithMembers)
@@ -272,7 +292,7 @@ def get_ledger(
     ledger = get_ledger_or_404(db, ledger_id)
     require_ledger_member(db, ledger_id, current_user)
 
-    # Get members with user details (include pending so owner can see outstanding invitations)
+    # Include pending/rejected so owners can see outstanding and declined invitations.
     members = (
         db.query(LedgerMember)
         .options(joinedload(LedgerMember.user))
@@ -358,9 +378,16 @@ def get_ledger_overview(
     for expense in expenses:
         effective_status = expense.status
         if effective_status == ExpenseStatus.PENDING:
-            required_ids = {
+            from app.routers.expenses import required_confirmation_user_ids
+
+            split_ids = {
                 split.user_id for split in expense.splits if split.user_id is not None
-            } - {expense.created_by}
+            }
+            required_ids = required_confirmation_user_ids(
+                split_ids,
+                created_by=expense.created_by,
+                payer_id=expense.payer_id,
+            )
             confirmed_ids = {
                 confirmation.user_id
                 for confirmation in expense.confirmations
@@ -369,25 +396,12 @@ def get_ledger_overview(
             if required_ids <= confirmed_ids:
                 effective_status = ExpenseStatus.CONFIRMED
 
-        expense_responses.append(ExpenseWithDetails(
-            id=expense.id,
-            ledger_id=expense.ledger_id,
-            payer_id=expense.payer_id,
-            created_by=expense.created_by,
-            title=expense.title,
-            total_amount=expense.total_amount,
-            note=expense.note,
-            expense_date=expense.expense_date,
-            status=effective_status.value,
-            created_at=expense.created_at,
-            updated_at=expense.updated_at,
-            payer=UserResponse.model_validate(expense.payer),
-            splits=[ExpenseSplitResponse.model_validate(split) for split in expense.splits],
-            confirmations=[
-                ExpenseConfirmationResponse.model_validate(confirmation)
-                for confirmation in expense.confirmations
-            ],
-        ))
+        expense_responses.append(
+            expense_to_with_details(
+                expense,
+                status=effective_status.value,
+            )
+        )
 
     history = []
 
@@ -573,10 +587,26 @@ def add_member(
         LedgerMember.user_id == request.user_id
     ).first()
 
-    if existing and existing.status == "removed":
+    # Re-invite users who previously left or declined.
+    if existing and existing.status in ("removed", "rejected"):
+        previous_status = existing.status
         existing.status = "pending"
         db.commit()
         db.refresh(existing)
+        logger.info(
+            "Re-invited regular member ledger_id=%s member_id=%s user_id=%s previous_status=%s",
+            ledger_id,
+            existing.id,
+            request.user_id,
+            previous_status,
+        )
+        invitation_cache.invalidate_pending_invitations(request.user_id)
+        send_push_safely(db, [request.user_id], build_payload(
+            event=PushEvent.LEDGER_INVITED,
+            actor_name=current_user.display_name or current_user.username,
+            ledger_name=ledger.name,
+            ledger_id=str(ledger_id),
+        ))
         return MemberResponse(
             id=existing.id,
             user_id=existing.user_id,
@@ -589,8 +619,18 @@ def add_member(
         )
 
     if existing:
-        logger.info("Duplicate regular member add rejected ledger_id=%s user_id=%s", ledger_id, request.user_id)
-        raise HTTPException(status_code=400, detail="User is already a member")
+        logger.info(
+            "Duplicate regular member add rejected ledger_id=%s user_id=%s status=%s",
+            ledger_id,
+            request.user_id,
+            existing.status,
+        )
+        detail = (
+            "Invitation already pending"
+            if existing.status == "pending"
+            else "User is already a member"
+        )
+        raise HTTPException(status_code=400, detail=detail)
 
     # Add member
     member = LedgerMember(
@@ -603,6 +643,7 @@ def add_member(
     db.refresh(member)
     logger.info("Invited regular member ledger_id=%s member_id=%s user_id=%s", ledger_id, member.id, request.user_id)
 
+    invitation_cache.invalidate_pending_invitations(request.user_id)
     send_push_safely(db, [request.user_id], build_payload(
         event=PushEvent.LEDGER_INVITED,
         actor_name=current_user.display_name or current_user.username,
@@ -628,7 +669,7 @@ def get_members(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Get all members of a ledger (including pending invitations so members can see who hasn't joined yet)"""
+    """Get all members of a ledger (including pending/rejected invitations)."""
     require_ledger_member(db, ledger_id, current_user)
 
     members = (

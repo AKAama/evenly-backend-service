@@ -4,17 +4,16 @@ import string
 import time
 from typing import Dict
 
-from redis import Redis
 from redis.exceptions import RedisError
 
 from app.config import settings
+from app.services import redis_client
 
 logger = logging.getLogger(__name__)
 
 # In-memory fallback for local development when Redis is not configured.
 # Format: { email: { code: str, expires_at: float, sent_at: float } }
 verification_codes: Dict[str, dict] = {}
-_redis_client: Redis | None = None
 
 
 def generate_code(length: int = 6) -> str:
@@ -34,15 +33,6 @@ def _send_lock_key(email: str, purpose: str) -> str:
     return f"evenly:verification:{purpose}:sent:{email}"
 
 
-def _get_redis_client() -> Redis | None:
-    global _redis_client
-    if not settings.redis_url:
-        return None
-    if _redis_client is None:
-        _redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
-    return _redis_client
-
-
 def _send_with_memory_store(email: str, code: str, purpose: str) -> bool:
     now = time.time()
     key = f"{purpose}:{email}"
@@ -59,12 +49,12 @@ def _send_with_memory_store(email: str, code: str, purpose: str) -> bool:
 
 
 def _send_with_redis(email: str, code: str, purpose: str) -> bool | None:
-    redis_client = _get_redis_client()
-    if redis_client is None:
+    client = redis_client.get_redis()
+    if client is None:
         return None
 
     try:
-        locked = redis_client.set(
+        locked = client.set(
             _send_lock_key(email, purpose),
             "1",
             ex=settings.verification_send_interval_seconds,
@@ -73,7 +63,7 @@ def _send_with_redis(email: str, code: str, purpose: str) -> bool | None:
         if not locked:
             return False
 
-        redis_client.set(
+        client.set(
             _code_key(email, purpose),
             code,
             ex=settings.verification_code_expire_seconds,
@@ -85,18 +75,18 @@ def _send_with_redis(email: str, code: str, purpose: str) -> bool | None:
 
 
 def _verify_with_redis(email: str, code: str, purpose: str) -> bool | None:
-    redis_client = _get_redis_client()
-    if redis_client is None:
+    client = redis_client.get_redis()
+    if client is None:
         return None
 
     try:
         key = _code_key(email, purpose)
-        stored_code = redis_client.get(key)
+        stored_code = client.get(key)
         if stored_code != code:
             return False
 
-        redis_client.delete(key)
-        redis_client.delete(_send_lock_key(email, purpose))
+        client.delete(key)
+        client.delete(_send_lock_key(email, purpose))
         return True
     except RedisError:
         logger.exception("Redis verification store unavailable; falling back to in-memory store")

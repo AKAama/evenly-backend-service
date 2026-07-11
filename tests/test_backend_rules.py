@@ -32,8 +32,20 @@ from app.models import (
     Settlement,
     User,
 )
-from app.routers.expenses import confirm_expense, create_expense, delete_expense
-from app.routers.ledgers import accept_invitation, create_ledger, get_ledger, get_ledgers, get_members, remove_member
+from app.routers.expenses import confirm_expense, create_expense, delete_expense, get_expenses
+from app.routers.ledgers import (
+    accept_invitation,
+    add_member as add_member_endpoint,
+    create_ledger,
+    get_ledger,
+    get_ledger_overview,
+    get_ledgers,
+    get_members,
+    get_pending_invitations,
+    reject_invitation,
+    remove_member,
+)
+from app.schemas.ledger import AddMemberRequest
 from app.routers import users as users_router
 from app.schemas.ledger import LedgerCreate, MemberCreate
 from app.routers.settlements import create_settlement, get_settlements
@@ -193,6 +205,66 @@ def test_settings_layer_defaults_local_config_and_environment(tmp_path, monkeypa
     assert settings.asr_vad_silence_time == 500
     assert settings.asr_engine_model_type == "16k_zh"
     assert settings.asr_final_timeout_seconds == 3
+
+
+def test_apns_private_key_is_loaded_from_path_next_to_config(tmp_path, monkeypatch):
+    defaults_path = tmp_path / "config.defaults.yaml"
+    config_path = tmp_path / "config.yaml"
+    key_path = tmp_path / "AuthKey_TESTKEYID.p8"
+    pem = textwrap.dedent("""\
+        -----BEGIN PRIVATE KEY-----
+        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAAAAAAAAAAAAAAAA
+        AAAAAAAAAAAAAAAAAAAAAAAAAAahRANCAASAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        -----END PRIVATE KEY-----
+    """).strip()
+    key_path.write_text(pem + "\n", encoding="utf-8")
+    defaults_path.write_text(textwrap.dedent("""
+        db:
+          host: default-db
+          port: 5432
+          database: evenly
+          user: postgres
+          password: postgres
+        verification_code_expire_seconds: 600
+        verification_send_interval_seconds: 60
+        jwt_secret_key: default-secret
+        jwt_expire_minutes: 1440
+        algorithm: HS256
+        auth_cookie_name: evenly_access_token
+        auth_cookie_secure: false
+        auth_cookie_samesite: lax
+        apple_client_id: com.yhma.Evenly
+        openai_url: https://api.openai.com/v1/chat/completions
+        openai_transcription_model: gpt-4o-mini-transcribe
+        openai_text_model: gpt-4o-mini
+        asr_engine_model_type: "16k_zh"
+        asr_endpoint: "wss://asr.cloud.tencent.com/asr/v2/"
+        asr_needvad: 1
+        asr_vad_silence_time: 800
+        asr_filter_modal: 2
+        asr_filter_punc: 0
+        asr_convert_num_mode: 1
+        asr_hotword_weight: 100
+        asr_connect_timeout_seconds: 10
+        asr_final_timeout_seconds: 5
+        slow_request_threshold_ms: 20.0
+    """))
+    config_path.write_text(textwrap.dedent("""
+        apns_team_id: TEAMID1234
+        apns_key_id: TESTKEYID
+        apns_private_key_path: AuthKey_TESTKEYID.p8
+        apns_bundle_id: com.yhma.Evenly
+    """))
+    monkeypatch.delenv("APNS_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("APNS_PRIVATE_KEY_PATH", raising=False)
+
+    settings = load_settings(config_path=config_path, defaults_path=defaults_path)
+
+    assert settings.apns_team_id == "TEAMID1234"
+    assert settings.apns_key_id == "TESTKEYID"
+    assert settings.apns_private_key == pem
+    assert settings.apns_private_key_path.endswith("AuthKey_TESTKEYID.p8")
 
 
 def add_member(db, ledger, user):
@@ -733,6 +805,82 @@ def test_registered_member_must_accept_ledger_invitation(db):
     assert len(get_ledgers(db=db, current_user=friend)) == 1
 
 
+def test_reject_invitation_keeps_rejected_membership_row(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+
+    response = create_ledger(
+        LedgerCreate(
+            name="Trip",
+            members=[MemberCreate(user_id=friend.id, nickname="Friend")],
+        ),
+        db=db,
+        current_user=owner,
+    )
+    invitation = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == response.id,
+        LedgerMember.user_id == friend.id,
+    ).one()
+    invitation_id = invitation.id
+
+    reject_invitation(invitation_id, db=db, current_user=friend)
+
+    membership = db.query(LedgerMember).filter(LedgerMember.id == invitation_id).one()
+    assert membership.status == "rejected"
+    assert get_pending_invitations(db=db, current_user=friend) == []
+    assert get_ledgers(db=db, current_user=friend) == []
+
+    # Owner can still see the declined invite on the ledger.
+    detail = get_ledger(response.id, db=db, current_user=owner)
+    statuses = {m.user_id: m.status for m in detail.members}
+    assert statuses[friend.id] == "rejected"
+
+
+def test_reinvite_rejected_member_sets_pending_again(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    membership = LedgerMember(
+        ledger_id=ledger.id,
+        user_id=friend.id,
+        status="rejected",
+    )
+    db.add(membership)
+    db.commit()
+    db.refresh(membership)
+    original_id = membership.id
+
+    reinvited = add_member_endpoint(
+        ledger.id,
+        AddMemberRequest(user_id=friend.id, is_temporary=False),
+        db=db,
+        current_user=owner,
+    )
+
+    assert reinvited.id == original_id
+    assert reinvited.status == "pending"
+    db.refresh(membership)
+    assert membership.status == "pending"
+    pending = get_pending_invitations(db=db, current_user=friend)
+    assert len(pending) == 1
+    assert pending[0].id == original_id
+
+    # Pending invite cannot be invited again.
+    with pytest.raises(HTTPException) as exc_info:
+        add_member_endpoint(
+            ledger.id,
+            AddMemberRequest(user_id=friend.id, is_temporary=False),
+            db=db,
+            current_user=owner,
+        )
+    assert_http_error(exc_info, 400)
+
+    accept_invitation(original_id, db=db, current_user=friend)
+    db.refresh(membership)
+    assert membership.status == "active"
+    assert len(get_ledgers(db=db, current_user=friend)) == 1
+
+
 def test_ledger_summary_counts_members_and_expenses(db):
     owner = make_user(db, "owner@example.com", "Owner")
     friend = make_user(db, "friend@example.com", "Friend")
@@ -789,6 +937,19 @@ def test_expense_category_icon_is_persisted(db, icon_type, icon_value):
     assert expense.category == "餐饮"
     assert expense.icon_type == icon_type
     assert expense.icon_value == icon_value
+
+    # List + overview must surface icons (regression: constructors dropped them → app ¥ fallback).
+    listed = get_expenses(ledger.id, db=db, current_user=owner)
+    assert len(listed) == 1
+    assert listed[0].category == "餐饮"
+    assert listed[0].icon_type == icon_type
+    assert listed[0].icon_value == icon_value
+
+    overview = get_ledger_overview(ledger.id, db=db, current_user=owner)
+    assert len(overview.expenses) == 1
+    assert overview.expenses[0].category == "餐饮"
+    assert overview.expenses[0].icon_type == icon_type
+    assert overview.expenses[0].icon_value == icon_value
 
 
 def test_expense_without_category_icon_remains_compatible():
@@ -1046,6 +1207,63 @@ def test_only_expense_participants_confirm_and_temp_members_do_not_block(db):
     with pytest.raises(HTTPException) as exc_info:
         confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=observer)
     assert_http_error(exc_info, 403)
+
+
+def test_payer_does_not_need_to_confirm_expense(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    payer = make_user(db, "payer@example.com", "Payer")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, payer)
+    add_member(db, ledger, friend)
+
+    # Creator is owner, payer is someone else; friend still must confirm.
+    expense = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Taxi",
+            total_amount=Decimal("30.00"),
+            expense_date=date.today(),
+            payer_id=payer.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("10.00")),
+                ExpenseSplitCreate(user_id=payer.id, amount=Decimal("10.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("10.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+
+    auto_confirmed = {
+        row.user_id
+        for row in db.query(ExpenseConfirmation).filter(
+            ExpenseConfirmation.expense_id == expense.id,
+            ExpenseConfirmation.status == "confirmed",
+        ).all()
+    }
+    assert owner.id in auto_confirmed
+    assert payer.id in auto_confirmed
+    assert friend.id not in auto_confirmed
+    assert expense.status == ExpenseStatus.PENDING
+
+    with pytest.raises(HTTPException) as exc_info:
+        confirm_expense(
+            expense.id,
+            ConfirmExpenseRequest(status="confirmed"),
+            db=db,
+            current_user=payer,
+        )
+    assert_http_error(exc_info, 400)
+
+    confirm_expense(
+        expense.id,
+        ConfirmExpenseRequest(status="confirmed"),
+        db=db,
+        current_user=friend,
+    )
+    db.refresh(expense)
+    assert expense.status == ExpenseStatus.CONFIRMED
 
 
 def test_settlement_rejects_same_user_and_non_positive_amount(db):
@@ -1385,7 +1603,7 @@ def test_verification_code_is_rate_limited_and_consumed(monkeypatch):
     verification.verification_codes.clear()
     monkeypatch.setattr(verification.settings, "redis_url", None)
     monkeypatch.setattr(verification.settings, "verification_send_interval_seconds", 60)
-    monkeypatch.setattr(verification, "_redis_client", None)
+    monkeypatch.setattr("app.services.redis_client.get_redis", lambda: None)
     monkeypatch.setattr(verification, "generate_code", lambda length=6: "123456")
     monkeypatch.setattr("app.services.email.get_email_service", lambda: None)
 
@@ -1399,7 +1617,7 @@ def test_expired_verification_code_is_rejected(monkeypatch):
     verification.verification_codes.clear()
     monkeypatch.setattr(verification.settings, "redis_url", None)
     monkeypatch.setattr(verification.settings, "verification_code_expire_seconds", -1)
-    monkeypatch.setattr(verification, "_redis_client", None)
+    monkeypatch.setattr("app.services.redis_client.get_redis", lambda: None)
     monkeypatch.setattr(verification, "generate_code", lambda length=6: "654321")
     monkeypatch.setattr("app.services.email.get_email_service", lambda: None)
 
@@ -1410,7 +1628,7 @@ def test_expired_verification_code_is_rejected(monkeypatch):
 def test_verification_codes_are_isolated_by_purpose(monkeypatch):
     verification.verification_codes.clear()
     monkeypatch.setattr(verification.settings, "redis_url", None)
-    monkeypatch.setattr(verification, "_redis_client", None)
+    monkeypatch.setattr("app.services.redis_client.get_redis", lambda: None)
     monkeypatch.setattr(verification, "generate_code", lambda length=6: "112233")
     monkeypatch.setattr("app.services.email.get_email_service", lambda: None)
 
@@ -1640,7 +1858,7 @@ def test_apple_login_creates_identity_and_reuses_account(db, client, monkeypatch
 def test_apple_user_can_choose_username_and_set_password(db, client, monkeypatch):
     verification.verification_codes.clear()
     monkeypatch.setattr(verification.settings, "redis_url", None)
-    monkeypatch.setattr(verification, "_redis_client", None)
+    monkeypatch.setattr("app.services.redis_client.get_redis", lambda: None)
     monkeypatch.setattr(verification, "generate_code", lambda length=6: "246810")
     monkeypatch.setattr("app.services.email.get_email_service", lambda: None)
     monkeypatch.setattr(

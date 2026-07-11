@@ -44,3 +44,13 @@ asr_connect_timeout_seconds: 10
 asr_final_timeout_seconds: 5
 
 slow_request_threshold_ms: 20.0
+
+# APNs — required for iOS system push (ledger invites, expense alerts).
+# Create a key at https://developer.apple.com/account/resources/authkeys/list
+# with "Apple Push Notifications service (APNs)" enabled.
+# Prefer placing AuthKey_*.p8 next to config.yaml and referencing the path:
+# apns_team_id: "XXXXXXXXXX"
+# apns_key_id: "YYYYYYYYYY"
+# apns_private_key_path: "AuthKey_YYYYYYYYYY.p8"
+# apns_bundle_id: "com.yhma.Evenly"
+# Inline PEM (or APNS_PRIVATE_KEY env) is still supported if needed.
