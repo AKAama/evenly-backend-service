@@ -32,7 +32,14 @@ from app.models import (
     Settlement,
     User,
 )
-from app.routers.expenses import confirm_expense, create_expense, delete_expense, get_expenses
+from app.routers.expenses import (
+    confirm_expense,
+    create_compound_expense,
+    create_expense,
+    delete_expense,
+    get_expenses,
+    update_expense,
+)
 from app.routers.ledgers import (
     accept_invitation,
     add_member as add_member_endpoint,
@@ -41,15 +48,25 @@ from app.routers.ledgers import (
     get_ledger_overview,
     get_ledgers,
     get_members,
+    get_or_create_invite_link,
     get_pending_invitations,
+    join_via_invite_link,
+    preview_invite_link,
     reject_invitation,
     remove_member,
+    rotate_invite_link,
 )
 from app.schemas.ledger import AddMemberRequest
 from app.routers import users as users_router
 from app.schemas.ledger import LedgerCreate, MemberCreate
 from app.routers.settlements import create_settlement, get_settlements
-from app.schemas.expense import ConfirmExpenseRequest, ExpenseCreate, ExpenseSplitCreate
+from app.schemas.expense import (
+    CompoundExpenseCreate,
+    ConfirmExpenseRequest,
+    ExpenseCreate,
+    ExpenseSplitCreate,
+    ExpenseUpdate,
+)
 from app.schemas.settlement import SettlementCreate
 from app.services import verification
 from app.services.tencent_asr import TencentASRError, _build_hotword_list, stream_tencent_asr
@@ -967,6 +984,48 @@ def test_expense_without_category_icon_remains_compatible():
     assert payload.icon_value is None
 
 
+def test_ledger_invite_link_qr_join_flow(db):
+    owner = make_user(db, "qr-owner@example.com", "Owner")
+    friend = make_user(db, "qr-friend@example.com", "Friend")
+    stranger = make_user(db, "qr-stranger@example.com", "Stranger")
+    ledger = make_ledger(db, owner)
+
+    link = get_or_create_invite_link(ledger.id, db=db, current_user=owner)
+    again = get_or_create_invite_link(ledger.id, db=db, current_user=owner)
+    assert link.token == again.token
+    assert link.url.endswith(f"/join/{link.token}")
+
+    preview = preview_invite_link(link.token, db=db)
+    assert preview.valid is True
+    assert preview.ledger_name == ledger.name
+    assert preview.owner_name == "Owner"
+
+    joined = join_via_invite_link(link.token, db=db, current_user=friend)
+    assert joined.status == "active"
+    assert joined.ledger_id == ledger.id
+
+    already = join_via_invite_link(link.token, db=db, current_user=friend)
+    assert already.status == "already_member"
+
+    # Non-owner cannot mint invite links.
+    with pytest.raises(HTTPException) as forbidden:
+        get_or_create_invite_link(ledger.id, db=db, current_user=stranger)
+    assert forbidden.value.status_code == 403
+
+    rotated = rotate_invite_link(ledger.id, db=db, current_user=owner)
+    assert rotated.token != link.token
+    with pytest.raises(HTTPException) as invalid:
+        preview_invite_link(link.token, db=db)
+    assert invalid.value.status_code == 404
+
+    join_via_invite_link(rotated.token, db=db, current_user=stranger)
+    members = get_members(ledger.id, db=db, current_user=owner)
+    active_user_ids = {m.user_id for m in members if m.status == "active"}
+    assert owner.id in active_user_ids
+    assert friend.id in active_user_ids
+    assert stranger.id in active_user_ids
+
+
 @pytest.mark.parametrize(
     ("icon_type", "icon_value"),
     [("unknown", "fork.knife"), ("sf_symbol", "not.allowed"), ("emoji", "🍜🍚"), (None, "🍜")],
@@ -1066,6 +1125,182 @@ def test_delete_account_endpoint_requires_authentication(client):
     response = client.delete("/users/me")
 
     assert response.status_code == 401
+
+
+def test_lottery_income_settles_holder_pays_co_buyer(db):
+    """A pays ticket 20 (A+B); A receives win 2000 (A+B) → A pays B 990."""
+    from app.services.settlement import SettlementCalculator
+
+    a = make_user(db, "lottery-a@example.com", "A")
+    b = make_user(db, "lottery-b@example.com", "B")
+    ledger = make_ledger(db, a)
+    add_member(db, ledger, b)
+    a_member = db.query(LedgerMember).filter_by(ledger_id=ledger.id, user_id=a.id).one()
+    b_member = db.query(LedgerMember).filter_by(ledger_id=ledger.id, user_id=b.id).one()
+
+    compound = create_compound_expense(
+        ledger.id,
+        CompoundExpenseCreate(
+            title="合买彩票",
+            expense_date=date.today(),
+            participant_member_ids=[a_member.id, b_member.id],
+            cost_amount=Decimal("20.00"),
+            cost_payer_id=a.id,
+            income_amount=Decimal("2000.00"),
+            income_receiver_id=a.id,
+        ),
+        db=db,
+        current_user=a,
+    )
+    assert compound.group_id is not None
+    assert compound.cost.kind == "expense"
+    assert compound.income.kind == "income"
+    assert compound.cost.group_id == compound.group_id
+    assert compound.income.group_id == compound.group_id
+
+    # B is the only party who must confirm (A is creator + payer/receiver).
+    confirm_expense(compound.cost.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=b)
+    confirm_expense(compound.income.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=b)
+
+    calc = SettlementCalculator(db, ledger.id)
+    balances = calc.calculate_net_balances()
+    assert balances[a.id] == Decimal("-990.00")
+    assert balances[b.id] == Decimal("990.00")
+    settlements = calc.calculate_settlements()
+    assert len(settlements) == 1
+    assert settlements[0]["from_user_id"] == a.id
+    assert settlements[0]["to_user_id"] == b.id
+    assert settlements[0]["amount"] == Decimal("990.00")
+
+
+def test_update_pending_expense_resets_confirmations(db):
+    owner = make_user(db, "edit-owner@example.com", "Owner")
+    friend = make_user(db, "edit-friend@example.com", "Friend")
+    other = make_user(db, "edit-other@example.com", "Other")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+    add_member(db, ledger, other)
+
+    expense = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Dinner",
+            total_amount=Decimal("30.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("10.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("10.00")),
+                ExpenseSplitCreate(user_id=other.id, amount=Decimal("10.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+    confirm_expense(
+        expense.id,
+        ConfirmExpenseRequest(status="confirmed"),
+        db=db,
+        current_user=friend,
+    )
+    assert db.query(Expense).filter(Expense.id == expense.id).one().status == ExpenseStatus.PENDING
+
+    updated = update_expense(
+        expense.id,
+        ExpenseUpdate(
+            title="Dinner edited",
+            total_amount=Decimal("45.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("15.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("15.00")),
+                ExpenseSplitCreate(user_id=other.id, amount=Decimal("15.00")),
+            ],
+            category="餐饮",
+            icon_type="emoji",
+            icon_value="🍜",
+        ),
+        db=db,
+        current_user=owner,
+    )
+    assert updated.title == "Dinner edited"
+    assert updated.total_amount == Decimal("45.00")
+    assert updated.category == "餐饮"
+    assert updated.icon_value == "🍜"
+    assert updated.status == ExpenseStatus.PENDING.value
+
+    confs = db.query(ExpenseConfirmation).filter(ExpenseConfirmation.expense_id == expense.id).all()
+    assert {c.user_id for c in confs} == {owner.id}
+    splits = db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == expense.id).all()
+    assert len(splits) == 3
+    assert sum(s.amount for s in splits) == Decimal("45.00")
+
+
+def test_update_expense_rejects_non_creator_and_confirmed(db):
+    owner = make_user(db, "edit2-owner@example.com", "Owner")
+    friend = make_user(db, "edit2-friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+
+    expense = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Solo",
+            total_amount=Decimal("20.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[ExpenseSplitCreate(user_id=owner.id, amount=Decimal("20.00"))],
+        ),
+        db=db,
+        current_user=owner,
+    )
+    # Only owner in splits → auto-confirmed
+    assert expense.status == ExpenseStatus.CONFIRMED
+
+    payload = ExpenseUpdate(
+        title="Nope",
+        total_amount=Decimal("25.00"),
+        expense_date=date.today(),
+        payer_id=owner.id,
+        splits=[ExpenseSplitCreate(user_id=owner.id, amount=Decimal("25.00"))],
+    )
+    with pytest.raises(HTTPException) as confirmed_err:
+        update_expense(expense.id, payload, db=db, current_user=owner)
+    assert confirmed_err.value.status_code == 400
+
+    pending = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Shared",
+            total_amount=Decimal("20.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("10.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("10.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+    with pytest.raises(HTTPException) as forbidden:
+        update_expense(
+            pending.id,
+            ExpenseUpdate(
+                title="Hijack",
+                total_amount=Decimal("20.00"),
+                expense_date=date.today(),
+                payer_id=owner.id,
+                splits=[
+                    ExpenseSplitCreate(user_id=owner.id, amount=Decimal("10.00")),
+                    ExpenseSplitCreate(user_id=friend.id, amount=Decimal("10.00")),
+                ],
+            ),
+            db=db,
+            current_user=friend,
+        )
+    assert forbidden.value.status_code == 403
 
 
 def test_create_expense_rejects_split_for_non_member(db):

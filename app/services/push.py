@@ -23,6 +23,7 @@ _APNS_TOKEN_TTL_SECONDS = 50 * 60
 
 class PushEvent(str, Enum):
     EXPENSE_CREATED = "expense.created"
+    EXPENSE_UPDATED = "expense.updated"
     LEDGER_INVITED = "ledger.invited"
     EXPENSE_CONFIRMED = "expense.confirmed"
     EXPENSE_REJECTED = "expense.rejected"
@@ -30,6 +31,7 @@ class PushEvent(str, Enum):
 
 TITLES = {
     PushEvent.EXPENSE_CREATED: "有一笔新账单待确认",
+    PushEvent.EXPENSE_UPDATED: "账单已更新，请重新确认",
     PushEvent.LEDGER_INVITED: "你收到一个账本邀请",
     PushEvent.EXPENSE_CONFIRMED: "账单已确认",
     PushEvent.EXPENSE_REJECTED: "账单被否决",
@@ -49,7 +51,9 @@ def build_payload(
     ledger = ledger_name[:60]
     expense = (expense_name or "账单")[:80]
     if event == PushEvent.EXPENSE_CREATED:
-        body = f"{actor} 在「{ledger}」添加了“{expense}”"
+        body = f"{actor} 在「{ledger}」记了一笔“{expense}”"
+    elif event == PushEvent.EXPENSE_UPDATED:
+        body = f"{actor} 修改了「{ledger}」的“{expense}”，请重新确认"
     elif event == PushEvent.LEDGER_INVITED:
         body = f"{actor} 邀请你加入「{ledger}」"
     elif event == PushEvent.EXPENSE_CONFIRMED:

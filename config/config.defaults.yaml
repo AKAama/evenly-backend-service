@@ -8,6 +8,8 @@ db:
 cors:
   allow_origins:
     - http://localhost:5173
+    - http://localhost:5174
+    - https://app.ismyh.cn
   allow_credentials: true
   allow_methods:
     - "*"
@@ -24,6 +26,9 @@ auth_cookie_name: evenly_access_token
 auth_cookie_secure: false
 auth_cookie_samesite: lax
 apple_client_id: com.yhma.Evenly
+
+# Landing / Universal Link origin for ledger QR invites (no trailing slash).
+public_app_base_url: https://app.ismyh.cn
 
 # 语音转草稿：OpenAI-compatible Chat Completions
 openai_transcription_model: gpt-4o-mini-transcribe

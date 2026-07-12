@@ -1,4 +1,6 @@
 import logging
+import secrets
+from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -6,10 +8,12 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import joinedload, Session
 from typing import List
 
+from app.config import settings
 from app.database import get_db
 from app.models import (
     User,
     Ledger,
+    LedgerInviteLink,
     LedgerMember,
     Expense,
     ExpenseConfirmation,
@@ -25,6 +29,9 @@ from app.schemas.ledger import (
     MemberResponse,
     MemberCreate,
     LedgerInvitationResponse,
+    LedgerInviteLinkResponse,
+    LedgerInvitePreviewResponse,
+    JoinLedgerResponse,
     LedgerMemberWithUser,
     LedgerOverviewResponse,
 )
@@ -37,6 +44,58 @@ from app.services import invitation_cache
 
 router = APIRouter(prefix="/ledgers", tags=["ledgers"])
 logger = logging.getLogger(__name__)
+
+
+def _public_join_url(token: str) -> str:
+    base = (settings.public_app_base_url or "https://app.ismyh.cn").rstrip("/")
+    return f"{base}/join/{token}"
+
+
+def _new_invite_token() -> str:
+    # URL-safe, short enough for QR density, long enough to be unguessable.
+    return secrets.token_urlsafe(12)
+
+
+def _active_invite_link(db: Session, ledger_id: UUID) -> LedgerInviteLink | None:
+    return (
+        db.query(LedgerInviteLink)
+        .filter(
+            LedgerInviteLink.ledger_id == ledger_id,
+            LedgerInviteLink.revoked_at.is_(None),
+        )
+        .order_by(LedgerInviteLink.created_at.desc())
+        .first()
+    )
+
+
+def _require_ledger_owner(ledger: Ledger, current_user: User) -> None:
+    if ledger.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only owner can manage invite links")
+
+
+def _invite_link_response(link: LedgerInviteLink, ledger: Ledger) -> LedgerInviteLinkResponse:
+    return LedgerInviteLinkResponse(
+        token=link.token,
+        url=_public_join_url(link.token),
+        ledger_id=ledger.id,
+        ledger_name=ledger.name,
+        created_at=link.created_at,
+    )
+
+
+def _get_active_link_by_token(db: Session, token: str) -> tuple[LedgerInviteLink, Ledger]:
+    link = (
+        db.query(LedgerInviteLink)
+        .options(joinedload(LedgerInviteLink.ledger).joinedload(Ledger.owner))
+        .filter(
+            LedgerInviteLink.token == token,
+            LedgerInviteLink.revoked_at.is_(None),
+        )
+        .first()
+    )
+    if link is None or link.ledger is None:
+        raise HTTPException(status_code=404, detail="Invite link is invalid or expired")
+    return link, link.ledger
 
 
 @router.post("", response_model=LedgerWithMembers, status_code=status.HTTP_201_CREATED)
@@ -282,6 +341,143 @@ def reject_invitation(
     invitation_cache.invalidate_pending_invitations(current_user.id)
 
 
+# --- QR / Universal Link invites (paths registered before /{ledger_id}) ---
+
+
+@router.get("/invite-links/{token}/preview", response_model=LedgerInvitePreviewResponse)
+def preview_invite_link(token: str, db: Session = Depends(get_db)):
+    """Public preview for landing page (no auth). Does not join the ledger."""
+    link, ledger = _get_active_link_by_token(db, token)
+    owner = ledger.owner
+    owner_name = (
+        (owner.display_name or owner.username or owner.email)
+        if owner is not None
+        else "账本主人"
+    )
+    return LedgerInvitePreviewResponse(
+        token=link.token,
+        ledger_id=ledger.id,
+        ledger_name=ledger.name,
+        owner_name=owner_name,
+        valid=True,
+    )
+
+
+@router.post("/invite-links/{token}/join", response_model=JoinLedgerResponse)
+def join_via_invite_link(
+    token: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Join a ledger via QR / Universal Link. Authenticated user becomes an active member."""
+    link, ledger = _get_active_link_by_token(db, token)
+
+    existing = (
+        db.query(LedgerMember)
+        .filter(
+            LedgerMember.ledger_id == ledger.id,
+            LedgerMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if existing is not None:
+        if existing.status == "active":
+            return JoinLedgerResponse(
+                ledger_id=ledger.id,
+                ledger_name=ledger.name,
+                status="already_member",
+                member_id=existing.id,
+            )
+        # pending / rejected / removed → activate immediately (open QR invite).
+        existing.status = "active"
+        db.commit()
+        db.refresh(existing)
+        invitation_cache.invalidate_pending_invitations(current_user.id)
+        return JoinLedgerResponse(
+            ledger_id=ledger.id,
+            ledger_name=ledger.name,
+            status="active",
+            member_id=existing.id,
+        )
+
+    member = LedgerMember(
+        ledger_id=ledger.id,
+        user_id=current_user.id,
+        status="active",
+    )
+    db.add(member)
+    db.commit()
+    db.refresh(member)
+    invitation_cache.invalidate_pending_invitations(current_user.id)
+    logger.info(
+        "User joined via invite link ledger_id=%s user_id=%s token=%s",
+        ledger.id,
+        current_user.id,
+        token[:6],
+    )
+    return JoinLedgerResponse(
+        ledger_id=ledger.id,
+        ledger_name=ledger.name,
+        status="active",
+        member_id=member.id,
+    )
+
+
+@router.get("/{ledger_id}/invite-link", response_model=LedgerInviteLinkResponse)
+def get_or_create_invite_link(
+    ledger_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Owner: return the active share/QR invite link, creating one if needed."""
+    ledger = get_ledger_or_404(db, ledger_id)
+    _require_ledger_owner(ledger, current_user)
+
+    link = _active_invite_link(db, ledger_id)
+    if link is None:
+        link = LedgerInviteLink(
+            ledger_id=ledger_id,
+            token=_new_invite_token(),
+            created_by=current_user.id,
+        )
+        db.add(link)
+        db.commit()
+        db.refresh(link)
+    return _invite_link_response(link, ledger)
+
+
+@router.post("/{ledger_id}/invite-link/rotate", response_model=LedgerInviteLinkResponse)
+def rotate_invite_link(
+    ledger_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Owner: revoke the current invite link and issue a new one (invalidates old QR)."""
+    ledger = get_ledger_or_404(db, ledger_id)
+    _require_ledger_owner(ledger, current_user)
+
+    now = datetime.utcnow()
+    for link in (
+        db.query(LedgerInviteLink)
+        .filter(
+            LedgerInviteLink.ledger_id == ledger_id,
+            LedgerInviteLink.revoked_at.is_(None),
+        )
+        .all()
+    ):
+        link.revoked_at = now
+
+    new_link = LedgerInviteLink(
+        ledger_id=ledger_id,
+        token=_new_invite_token(),
+        created_by=current_user.id,
+    )
+    db.add(new_link)
+    db.commit()
+    db.refresh(new_link)
+    return _invite_link_response(new_link, ledger)
+
+
 @router.get("/{ledger_id}", response_model=LedgerWithMembers)
 def get_ledger(
     ledger_id: UUID,
@@ -414,14 +610,17 @@ def get_ledger_overview(
         )
         for member in registered_members
     }
+    from app.services.settlement import balance_sign_for_kind
+
     for expense in expenses:
         if expense.status != ExpenseStatus.CONFIRMED:
             continue
+        sign = balance_sign_for_kind(getattr(expense, "kind", None))
         if expense.payer_id in balances:
-            balances[expense.payer_id] += expense.total_amount
+            balances[expense.payer_id] += sign * Decimal(str(expense.total_amount))
         for split in expense.splits:
             if split.user_id in balances:
-                balances[split.user_id] -= split.amount
+                balances[split.user_id] -= sign * Decimal(str(split.amount))
     creditors = sorted(
         [(user_id, amount) for user_id, amount in balances.items() if amount > 0],
         key=lambda item: item[1],
@@ -724,30 +923,36 @@ def member_has_history(db: Session, ledger_id: UUID, membership: LedgerMember) -
 
 
 def member_balance(db: Session, ledger_id: UUID, membership: LedgerMember) -> Decimal:
-    """Return paid - owed + settled for a member across non-rejected expenses."""
-    owed = (
-        db.query(func.coalesce(func.sum(ExpenseSplit.amount), 0))
-        .join(Expense)
+    """Return signed paid - owed + settled for a member across non-rejected entries.
+
+    Income entries invert paid/owed signs so winnings held by one person
+    correctly create payouts to co-participants.
+    """
+    from app.services.settlement import balance_sign_for_kind
+
+    net = Decimal("0")
+    rows = (
+        db.query(Expense)
+        .options(joinedload(Expense.splits))
         .filter(
             Expense.ledger_id == ledger_id,
             Expense.status != ExpenseStatus.REJECTED,
-            ExpenseSplit.member_id == membership.id,
         )
-        .scalar()
+        .all()
     )
+    for expense in rows:
+        sign = balance_sign_for_kind(getattr(expense, "kind", None))
+        if membership.user_id is not None and expense.payer_id == membership.user_id:
+            net += sign * Decimal(str(expense.total_amount))
+        for split in expense.splits:
+            if split.member_id == membership.id or (
+                membership.user_id is not None and split.user_id == membership.user_id
+            ):
+                net -= sign * Decimal(str(split.amount))
 
     if membership.user_id is None:
-        return -Decimal(str(owed or 0))
+        return net
 
-    paid = (
-        db.query(func.coalesce(func.sum(Expense.total_amount), 0))
-        .filter(
-            Expense.ledger_id == ledger_id,
-            Expense.status != ExpenseStatus.REJECTED,
-            Expense.payer_id == membership.user_id,
-        )
-        .scalar()
-    )
     settled_out = (
         db.query(func.coalesce(func.sum(Settlement.amount), 0))
         .filter(
@@ -765,8 +970,7 @@ def member_balance(db: Session, ledger_id: UUID, membership: LedgerMember) -> De
         .scalar()
     )
     return (
-        Decimal(str(paid or 0))
-        - Decimal(str(owed or 0))
+        net
         + Decimal(str(settled_out or 0))
         - Decimal(str(settled_in or 0))
     )

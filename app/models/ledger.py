@@ -22,6 +22,31 @@ class Ledger(Base):
     members = relationship("LedgerMember", back_populates="ledger", cascade="all, delete-orphan")
     expenses = relationship("Expense", back_populates="ledger", cascade="all, delete-orphan")
     settlements = relationship("Settlement", back_populates="ledger", cascade="all, delete-orphan")
+    invite_links = relationship(
+        "LedgerInviteLink",
+        back_populates="ledger",
+        cascade="all, delete-orphan",
+    )
+
+
+class LedgerInviteLink(Base):
+    """Shareable QR / Universal Link token for joining a ledger."""
+
+    __tablename__ = "ledger_invite_links"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ledger_id = Column(UUID(as_uuid=True), ForeignKey("ledgers.id", ondelete="CASCADE"), nullable=False)
+    token = Column(String(64), nullable=False, unique=True)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+
+    ledger = relationship("Ledger", back_populates="invite_links")
+    creator = relationship("User")
+
+    @property
+    def is_active(self) -> bool:
+        return self.revoked_at is None
 
 
 class LedgerMember(Base):

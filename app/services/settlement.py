@@ -1,9 +1,14 @@
 from decimal import Decimal
 from uuid import UUID
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
 
 from app.models import Expense, ExpenseSplit, LedgerMember, User, Settlement, ExpenseStatus
+
+
+def balance_sign_for_kind(kind: str | None) -> Decimal:
+    """Income is the dual of expense: reverse paid/owed signs in net = paid - owed."""
+    return Decimal("-1") if (kind or "expense") == "income" else Decimal("1")
 
 
 class SettlementCalculator:
@@ -18,6 +23,7 @@ class SettlementCalculator:
         """Get expenses approved by every required participant."""
         return (
             self.db.query(Expense)
+            .options(joinedload(Expense.splits))
             .filter(
                 Expense.ledger_id == self.ledger_id,
                 Expense.status == ExpenseStatus.CONFIRMED
@@ -40,54 +46,26 @@ class SettlementCalculator:
 
     def calculate_net_balances(self) -> dict[UUID, Decimal]:
         """
-        Calculate net balance for each user.
-        net = paid_amount - owed_amount
+        Calculate net balance for each registered user.
+
+        Expense: net contribution uses paid - owed (payer paid total, each owes split).
+        Income: same formula with inverted signs (receiver held total, each is entitled to split).
 
         Positive net: user should receive money
         Negative net: user owes money
         """
         members = self.get_ledger_members()
-        member_ids = [m.user_id for m in members]
+        member_ids = {m.user_id for m in members if m.user_id is not None}
+        net_balances: dict[UUID, Decimal] = {uid: Decimal("0") for uid in member_ids}
 
-        # Step 1: Calculate owed amounts (from expense_splits)
-        # Each user owes the sum of their splits
-        owed_amounts = (
-            self.db.query(ExpenseSplit.user_id, func.sum(ExpenseSplit.amount))
-            .join(Expense)
-            .filter(
-                Expense.ledger_id == self.ledger_id,
-                Expense.status == ExpenseStatus.CONFIRMED,
-                ExpenseSplit.user_id.in_(member_ids)
-            )
-            .group_by(ExpenseSplit.user_id)
-            .all()
-        )
+        for expense in self.get_confirmed_expenses():
+            sign = balance_sign_for_kind(getattr(expense, "kind", None))
+            if expense.payer_id in net_balances:
+                net_balances[expense.payer_id] += sign * Decimal(str(expense.total_amount))
+            for split in expense.splits:
+                if split.user_id is not None and split.user_id in net_balances:
+                    net_balances[split.user_id] -= sign * Decimal(str(split.amount))
 
-        owed_dict: dict[UUID, Decimal] = {uid: Decimal(str(amount or 0)) for uid, amount in owed_amounts}
-
-        # Step 2: Calculate paid amounts (from expenses as payer)
-        paid_amounts = (
-            self.db.query(Expense.payer_id, func.sum(Expense.total_amount))
-            .filter(
-                Expense.ledger_id == self.ledger_id,
-                Expense.status == ExpenseStatus.CONFIRMED,
-                Expense.payer_id.in_(member_ids)
-            )
-            .group_by(Expense.payer_id)
-            .all()
-        )
-
-        paid_dict: dict[UUID, Decimal] = {uid: Decimal(str(amount or 0)) for uid, amount in paid_amounts}
-
-        # Step 3: Calculate net balances (receives positive = credits, gives negative = debts)
-        net_balances: dict[UUID, Decimal] = {}
-        for member in members:
-            uid = member.user_id
-            owed = owed_dict.get(uid, Decimal("0"))
-            paid = paid_dict.get(uid, Decimal("0"))
-            net_balances[uid] = paid - owed
-
-        # Round away tiny floating-point noise
         for uid in list(net_balances.keys()):
             if abs(net_balances[uid]) < Decimal("0.01"):
                 net_balances[uid] = Decimal("0")

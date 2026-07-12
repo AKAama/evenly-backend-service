@@ -25,6 +25,13 @@ class ExpenseStatus(str, enum.Enum):
     REJECTED = "rejected"
 
 
+class ExpenseKind(str, enum.Enum):
+    """expense: money out (cost). income: money in (winnings, refunds)."""
+
+    EXPENSE = "expense"
+    INCOME = "income"
+
+
 class Expense(Base):
     __tablename__ = "expenses"
     __table_args__ = (
@@ -34,14 +41,19 @@ class Expense(Base):
             "(icon_type IN ('sf_symbol', 'emoji') AND icon_value IS NOT NULL)",
             name="ck_expenses_icon_pair",
         ),
+        CheckConstraint("kind IN ('expense', 'income')", name="ck_expenses_kind"),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     ledger_id = Column(UUID(as_uuid=True), ForeignKey("ledgers.id", ondelete="CASCADE"), nullable=False)
+    # Expense: who paid. Income: who received the money (e.g. lottery prize holder).
     payer_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     title = Column(String(255))
     total_amount = Column(Numeric(12, 2), nullable=False)
+    kind = Column(String(20), nullable=False, default=ExpenseKind.EXPENSE.value, server_default="expense")
+    # Optional link for multi-part bills (e.g. lottery cost + prize shown as one card).
+    group_id = Column(UUID(as_uuid=True), nullable=True, index=True)
     note = Column(Text)
     category = Column(String(50), nullable=True)
     icon_type = Column(String(20), nullable=True)

@@ -60,6 +60,8 @@ class ExpenseConfirmationResponse(ExpenseConfirmationBase):
 class ExpenseBase(BaseModel):
     title: str | None = None
     total_amount: Decimal
+    # expense = cost (default); income = winnings/refunds received by payer_id
+    kind: Literal["expense", "income"] = "expense"
     note: str | None = None
     expense_date: date
     category: str | None = Field(default=None, max_length=50)
@@ -81,6 +83,44 @@ class ExpenseBase(BaseModel):
 class ExpenseCreate(ExpenseBase):
     payer_id: UUID
     splits: list[ExpenseSplitCreate]
+    group_id: UUID | None = None
+
+
+class ExpenseUpdate(ExpenseBase):
+    """Full replace for a pending expense (same shape as create body)."""
+
+    payer_id: UUID
+    splits: list[ExpenseSplitCreate]
+
+
+class CompoundExpenseCreate(BaseModel):
+    """One form: cost (expense) + income, stored as two linked rows with the same group_id."""
+
+    title: str = Field(min_length=1, max_length=255)
+    expense_date: date
+    note: str | None = None
+    category: str | None = Field(default=None, max_length=50)
+    icon_type: Literal["sf_symbol", "emoji"] | None = None
+    icon_value: str | None = Field(default=None, max_length=100)
+    # Shared participants (member ids). Cost and income are split equally among them.
+    participant_member_ids: list[UUID] = Field(min_length=1)
+    cost_amount: Decimal
+    cost_payer_id: UUID
+    income_amount: Decimal
+    income_receiver_id: UUID
+
+    @model_validator(mode="after")
+    def validate_amounts_and_icon(self):
+        if self.cost_amount <= 0 or self.income_amount <= 0:
+            raise ValueError("cost_amount and income_amount must be greater than zero")
+        if self.icon_type is None and self.icon_value is None:
+            return self
+        if self.icon_type is None or self.icon_value is None:
+            raise ValueError("icon_type and icon_value must be provided together")
+        allowed = ALLOWED_EXPENSE_SF_SYMBOLS if self.icon_type == "sf_symbol" else ALLOWED_EXPENSE_EMOJIS
+        if self.icon_value not in allowed:
+            raise ValueError("Unsupported expense icon")
+        return self
 
 
 class ExpenseResponse(ExpenseBase):
@@ -91,8 +131,15 @@ class ExpenseResponse(ExpenseBase):
     payer_id: UUID
     created_by: UUID
     status: str
+    group_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class CompoundExpenseResponse(BaseModel):
+    group_id: UUID
+    cost: ExpenseResponse
+    income: ExpenseResponse
 
 
 class ExpenseWithDetails(ExpenseResponse):

@@ -94,6 +94,12 @@ class Settings(BaseSettings):
     apns_private_key_path: Optional[str] = Field(default=None, validation_alias="APNS_PRIVATE_KEY_PATH")
     apns_bundle_id: str = Field(default="com.yhma.Evenly", validation_alias="APNS_BUNDLE_ID")
 
+    # Public web origin used for QR / Universal Link invite URLs (landing site).
+    public_app_base_url: str = Field(
+        default="https://app.ismyh.cn",
+        validation_alias="PUBLIC_APP_BASE_URL",
+    )
+
     # OpenAI-backed voice expense drafts. The key is server-side only.
     openai_api_key: Optional[str] = Field(default=None, validation_alias=AliasChoices("OPENAI_API_KEY", "DASHSCOPE_API_KEY"))
     openai_transcription_model: str
@@ -161,6 +167,7 @@ _YAML_ALIASES = {
     "APNS_PRIVATE_KEY": "apns_private_key",
     "APNS_PRIVATE_KEY_PATH": "apns_private_key_path",
     "APNS_BUNDLE_ID": "apns_bundle_id",
+    "PUBLIC_APP_BASE_URL": "public_app_base_url",
 }
 
 

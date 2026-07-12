@@ -81,6 +81,29 @@ class LedgerInvitationResponse(BaseModel):
     created_at: datetime
 
 
+class LedgerInviteLinkResponse(BaseModel):
+    token: str
+    url: str
+    ledger_id: UUID
+    ledger_name: str
+    created_at: datetime
+
+
+class LedgerInvitePreviewResponse(BaseModel):
+    token: str
+    ledger_id: UUID
+    ledger_name: str
+    owner_name: str
+    valid: bool = True
+
+
+class JoinLedgerResponse(BaseModel):
+    ledger_id: UUID
+    ledger_name: str
+    status: str  # active | already_member
+    member_id: UUID
+
+
 class LedgerOverviewResponse(BaseModel):
     ledger: LedgerWithMembers
     expenses: list[ExpenseWithDetails]

@@ -14,8 +14,12 @@ from app.database import SessionLocal, get_db
 from app.models import User, Ledger, LedgerMember, Expense, ExpenseSplit, ExpenseConfirmation, ExpenseStatus
 from app.schemas.expense import (
     ExpenseCreate,
+    ExpenseUpdate,
     ExpenseResponse,
     ExpenseWithDetails,
+    ExpenseSplitCreate,
+    CompoundExpenseCreate,
+    CompoundExpenseResponse,
     ConfirmExpenseRequest,
     VoiceExpenseDraft,
     expense_to_with_details,
@@ -77,6 +81,65 @@ def get_active_voice_members(db: Session, ledger_id: UUID) -> list[dict[str, str
         }
         for member in rows
     ]
+
+
+def _resolve_expense_splits(
+    *,
+    ledger_id: UUID,
+    payload: ExpenseCreate | ExpenseUpdate,
+    db: Session,
+):
+    """Validate payer/splits for create and update. Returns (resolved_splits, payer_member)."""
+    if payload.total_amount <= 0:
+        raise HTTPException(status_code=400, detail="Expense amount must be greater than zero")
+
+    if not payload.splits:
+        raise HTTPException(status_code=400, detail="At least one split is required")
+
+    members = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == ledger_id,
+        LedgerMember.status == "active",
+    ).all()
+    members_by_id = {member.id: member for member in members}
+    members_by_user_id = {
+        member.user_id: member for member in members if member.user_id is not None
+    }
+
+    resolved_splits = []
+    for split in payload.splits:
+        member = members_by_id.get(split.member_id) if split.member_id else None
+        if member is None and split.user_id:
+            member = members_by_user_id.get(split.user_id)
+        if member is None:
+            raise HTTPException(status_code=400, detail="All split members must belong to the ledger")
+        if split.user_id and member.user_id != split.user_id:
+            raise HTTPException(status_code=400, detail="Split user and member do not match")
+        resolved_splits.append((split, member))
+
+    split_member_ids = [member.id for _, member in resolved_splits]
+    if len(split_member_ids) != len(set(split_member_ids)):
+        raise HTTPException(status_code=400, detail="Duplicate members in splits are not allowed")
+
+    if any(split.amount <= 0 for split in payload.splits):
+        raise HTTPException(status_code=400, detail="Split amounts must be greater than zero")
+
+    payer_member = members_by_user_id.get(payload.payer_id)
+    if payer_member is None or payer_member.is_temporary:
+        raise HTTPException(status_code=400, detail="Payer must be a registered ledger member")
+
+    split_total = normalize_money(sum(s.amount for s in payload.splits))
+    expense_total = normalize_money(payload.total_amount)
+    if split_total != expense_total:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Split total ({split_total}) must equal expense amount ({expense_total})",
+        )
+
+    payer_in_splits = any(member.id == payer_member.id for _, member in resolved_splits)
+    if not payer_in_splits:
+        raise HTTPException(status_code=400, detail="Payer must be included in splits")
+
+    return resolved_splits, payer_member
 
 
 def get_websocket_user(websocket: WebSocket, db: Session) -> User | None:
@@ -423,116 +486,26 @@ def create_expense(
     ledger = get_ledger_or_404(db, ledger_id)
     require_ledger_member(db, ledger_id, current_user)
 
-    if expense.total_amount <= 0:
-        raise HTTPException(status_code=400, detail="Expense amount must be greater than zero")
-
-    if not expense.splits:
-        raise HTTPException(status_code=400, detail="At least one split is required")
-
-    members = db.query(LedgerMember).filter(
-        LedgerMember.ledger_id == ledger_id,
-        LedgerMember.status == "active",
-    ).all()
-    members_by_id = {member.id: member for member in members}
-    members_by_user_id = {
-        member.user_id: member for member in members if member.user_id is not None
-    }
-
-    resolved_splits = []
-    for split in expense.splits:
-        member = members_by_id.get(split.member_id) if split.member_id else None
-        if member is None and split.user_id:
-            member = members_by_user_id.get(split.user_id)
-        if member is None:
-            raise HTTPException(status_code=400, detail="All split members must belong to the ledger")
-        if split.user_id and member.user_id != split.user_id:
-            raise HTTPException(status_code=400, detail="Split user and member do not match")
-        resolved_splits.append((split, member))
-
-    split_member_ids = [member.id for _, member in resolved_splits]
-    if len(split_member_ids) != len(set(split_member_ids)):
-        raise HTTPException(status_code=400, detail="Duplicate members in splits are not allowed")
-
-    if any(split.amount <= 0 for split in expense.splits):
-        raise HTTPException(status_code=400, detail="Split amounts must be greater than zero")
-
-    payer_member = members_by_user_id.get(expense.payer_id)
-    if payer_member is None or payer_member.is_temporary:
-        raise HTTPException(status_code=400, detail="Payer must be a registered ledger member")
-
-    # Validate splits total equals expense total
-    split_total = normalize_money(sum(s.amount for s in expense.splits))
-    expense_total = normalize_money(expense.total_amount)
-    if split_total != expense_total:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Split total ({split_total}) must equal expense amount ({expense_total})"
-        )
-
-    # Validate payer is in splits
-    payer_in_splits = any(member.id == payer_member.id for _, member in resolved_splits)
-    if not payer_in_splits:
-        raise HTTPException(status_code=400, detail="Payer must be included in splits")
+    resolved_splits, payer_member = _resolve_expense_splits(
+        ledger_id=ledger_id,
+        payload=expense,
+        db=db,
+    )
 
     # Create expense
-    db_expense = Expense(
+    db_expense = _persist_expense_row(
+        db=db,
         ledger_id=ledger_id,
-        payer_id=expense.payer_id,
+        payload=expense,
         created_by=current_user.id,
-        title=expense.title,
-        total_amount=expense.total_amount,
-        note=expense.note,
-        category=expense.category,
-        icon_type=expense.icon_type,
-        icon_value=expense.icon_value,
-        expense_date=expense.expense_date,
-        status=ExpenseStatus.PENDING,
+        resolved_splits=resolved_splits,
+        group_id=expense.group_id,
+        commit=True,
     )
-    db.add(db_expense)
-    # Keep the expense and all split rows in one transaction. If any split
-    # violates a constraint, no orphan expense is left behind.
-    db.flush()
 
-    # Create splits
-    for split, member in resolved_splits:
-        db_split = ExpenseSplit(
-            expense_id=db_expense.id,
-            user_id=member.user_id,
-            member_id=member.id,
-            amount=split.amount,
-        )
-        db.add(db_split)
-
-    # Creator and payer do not need to confirm. Auto-record their acknowledgement
-    # when they are registered participants so they are never prompted later.
-    registered_participant_ids = {
-        member.user_id for _, member in resolved_splits if member.user_id is not None
-    }
-    auto_confirm_ids = confirmation_exempt_user_ids(
-        created_by=current_user.id,
-        payer_id=expense.payer_id,
-    ) & registered_participant_ids
-    for user_id in auto_confirm_ids:
-        db.add(ExpenseConfirmation(
-            expense_id=db_expense.id,
-            user_id=user_id,
-            status="confirmed",
-        ))
-
-    required_participants = required_confirmation_user_ids(
-        registered_participant_ids,
-        created_by=current_user.id,
-        payer_id=expense.payer_id,
-    )
-    if not required_participants:
-        db_expense.status = ExpenseStatus.CONFIRMED
-
-    db.commit()
-    db.refresh(db_expense)
-
-    recipients = required_participants
-    if recipients:
-        send_push_safely(db, recipients, build_payload(
+    required_participants = _required_participants_for(resolved_splits, current_user.id, expense.payer_id)
+    if required_participants:
+        send_push_safely(db, required_participants, build_payload(
             event=PushEvent.EXPENSE_CREATED,
             actor_name=current_user.display_name or current_user.username,
             ledger_name=ledger.name,
@@ -542,6 +515,297 @@ def create_expense(
         ))
 
     return db_expense
+
+
+def _equal_splits(total: Decimal, member_ids: list[UUID]) -> list[ExpenseSplitCreate]:
+    n = len(member_ids)
+    cents = int((total * 100).to_integral_value())
+    base, rem = divmod(cents, n)
+    splits: list[ExpenseSplitCreate] = []
+    for i, mid in enumerate(member_ids):
+        part = base + (1 if i < rem else 0)
+        splits.append(ExpenseSplitCreate(member_id=mid, amount=Decimal(part) / 100))
+    return splits
+
+
+def _required_participants_for(resolved_splits, created_by, payer_id) -> set:
+    registered = {m.user_id for _, m in resolved_splits if m.user_id is not None}
+    return required_confirmation_user_ids(
+        registered,
+        created_by=created_by,
+        payer_id=payer_id,
+    )
+
+
+def _persist_expense_row(
+    *,
+    db: Session,
+    ledger_id: UUID,
+    payload: ExpenseCreate,
+    created_by,
+    resolved_splits,
+    group_id=None,
+    commit: bool = True,
+) -> Expense:
+    db_expense = Expense(
+        ledger_id=ledger_id,
+        payer_id=payload.payer_id,
+        created_by=created_by,
+        title=payload.title,
+        total_amount=payload.total_amount,
+        kind=payload.kind,
+        group_id=group_id if group_id is not None else payload.group_id,
+        note=payload.note,
+        category=payload.category,
+        icon_type=payload.icon_type,
+        icon_value=payload.icon_value,
+        expense_date=payload.expense_date,
+        status=ExpenseStatus.PENDING,
+    )
+    db.add(db_expense)
+    db.flush()
+
+    for split, member in resolved_splits:
+        db.add(
+            ExpenseSplit(
+                expense_id=db_expense.id,
+                user_id=member.user_id,
+                member_id=member.id,
+                amount=split.amount,
+            )
+        )
+
+    registered_participant_ids = {
+        member.user_id for _, member in resolved_splits if member.user_id is not None
+    }
+    auto_confirm_ids = confirmation_exempt_user_ids(
+        created_by=created_by,
+        payer_id=payload.payer_id,
+    ) & registered_participant_ids
+    for user_id in auto_confirm_ids:
+        db.add(
+            ExpenseConfirmation(
+                expense_id=db_expense.id,
+                user_id=user_id,
+                status="confirmed",
+            )
+        )
+
+    required = required_confirmation_user_ids(
+        registered_participant_ids,
+        created_by=created_by,
+        payer_id=payload.payer_id,
+    )
+    if not required:
+        db_expense.status = ExpenseStatus.CONFIRMED
+
+    if commit:
+        db.commit()
+        db.refresh(db_expense)
+    return db_expense
+
+
+@router.post(
+    "/ledgers/{ledger_id}/expenses/compound",
+    response_model=CompoundExpenseResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_compound_expense(
+    ledger_id: UUID,
+    body: CompoundExpenseCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create linked cost (expense) + income rows that appear as one bill in clients."""
+    ledger = get_ledger_or_404(db, ledger_id)
+    require_ledger_member(db, ledger_id, current_user)
+
+    member_ids = list(dict.fromkeys(body.participant_member_ids))  # preserve order, unique
+    if len(member_ids) < 1:
+        raise HTTPException(status_code=400, detail="At least one participant is required")
+
+    cost_splits = _equal_splits(body.cost_amount, member_ids)
+    income_splits = _equal_splits(body.income_amount, member_ids)
+    group_id = uuid4()
+
+    cost_payload = ExpenseCreate(
+        title=body.title,
+        total_amount=body.cost_amount,
+        kind="expense",
+        note=body.note,
+        expense_date=body.expense_date,
+        category=body.category,
+        icon_type=body.icon_type,
+        icon_value=body.icon_value,
+        payer_id=body.cost_payer_id,
+        splits=cost_splits,
+        group_id=group_id,
+    )
+    income_payload = ExpenseCreate(
+        title=body.title,
+        total_amount=body.income_amount,
+        kind="income",
+        note=body.note,
+        expense_date=body.expense_date,
+        category=body.category,
+        icon_type=body.icon_type,
+        icon_value=body.icon_value,
+        payer_id=body.income_receiver_id,
+        splits=income_splits,
+        group_id=group_id,
+    )
+
+    cost_resolved, _ = _resolve_expense_splits(ledger_id=ledger_id, payload=cost_payload, db=db)
+    income_resolved, _ = _resolve_expense_splits(ledger_id=ledger_id, payload=income_payload, db=db)
+
+    cost_row = _persist_expense_row(
+        db=db,
+        ledger_id=ledger_id,
+        payload=cost_payload,
+        created_by=current_user.id,
+        resolved_splits=cost_resolved,
+        group_id=group_id,
+        commit=False,
+    )
+    income_row = _persist_expense_row(
+        db=db,
+        ledger_id=ledger_id,
+        payload=income_payload,
+        created_by=current_user.id,
+        resolved_splits=income_resolved,
+        group_id=group_id,
+        commit=False,
+    )
+    db.commit()
+    db.refresh(cost_row)
+    db.refresh(income_row)
+
+    notify_ids = (
+        _required_participants_for(cost_resolved, current_user.id, body.cost_payer_id)
+        | _required_participants_for(income_resolved, current_user.id, body.income_receiver_id)
+    )
+    if notify_ids:
+        send_push_safely(
+            db,
+            notify_ids,
+            build_payload(
+                event=PushEvent.EXPENSE_CREATED,
+                actor_name=current_user.display_name or current_user.username,
+                ledger_name=ledger.name,
+                ledger_id=str(ledger_id),
+                expense_name=body.title,
+                expense_id=str(cost_row.id),
+            ),
+        )
+
+    return CompoundExpenseResponse(
+        group_id=group_id,
+        cost=ExpenseResponse.model_validate(cost_row),
+        income=ExpenseResponse.model_validate(income_row),
+    )
+
+
+@router.put("/{expense_id}", response_model=ExpenseResponse)
+def update_expense(
+    expense_id: UUID,
+    payload: ExpenseUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edit a pending expense (creator only). Resets other members' confirmations."""
+    expense = db.query(Expense).filter(Expense.id == expense_id).first()
+    if not expense:
+        raise HTTPException(status_code=404, detail="Expense not found")
+
+    require_ledger_member(db, expense.ledger_id, current_user)
+    if expense.created_by != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the expense creator can edit this expense")
+    if expense.status != ExpenseStatus.PENDING:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only pending expenses can be edited (current: {expense.status.value})",
+        )
+
+    resolved_splits, _payer_member = _resolve_expense_splits(
+        ledger_id=expense.ledger_id,
+        payload=payload,
+        db=db,
+    )
+
+    expense.title = payload.title
+    expense.total_amount = payload.total_amount
+    expense.kind = payload.kind
+    expense.note = payload.note
+    expense.category = payload.category
+    expense.icon_type = payload.icon_type
+    expense.icon_value = payload.icon_value
+    expense.expense_date = payload.expense_date
+    expense.payer_id = payload.payer_id
+    expense.status = ExpenseStatus.PENDING
+
+    # Replace splits + confirmations so previous acknowledgements cannot stick.
+    db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == expense.id).delete(
+        synchronize_session=False
+    )
+    db.query(ExpenseConfirmation).filter(ExpenseConfirmation.expense_id == expense.id).delete(
+        synchronize_session=False
+    )
+    db.flush()
+
+    for split, member in resolved_splits:
+        db.add(
+            ExpenseSplit(
+                expense_id=expense.id,
+                user_id=member.user_id,
+                member_id=member.id,
+                amount=split.amount,
+            )
+        )
+
+    registered_participant_ids = {
+        member.user_id for _, member in resolved_splits if member.user_id is not None
+    }
+    auto_confirm_ids = confirmation_exempt_user_ids(
+        created_by=expense.created_by,
+        payer_id=expense.payer_id,
+    ) & registered_participant_ids
+    for user_id in auto_confirm_ids:
+        db.add(
+            ExpenseConfirmation(
+                expense_id=expense.id,
+                user_id=user_id,
+                status="confirmed",
+            )
+        )
+
+    required_participants = required_confirmation_user_ids(
+        registered_participant_ids,
+        created_by=expense.created_by,
+        payer_id=expense.payer_id,
+    )
+    if not required_participants:
+        expense.status = ExpenseStatus.CONFIRMED
+
+    db.commit()
+    db.refresh(expense)
+
+    recipients = required_participants
+    if recipients:
+        ledger = get_ledger_or_404(db, expense.ledger_id)
+        send_push_safely(
+            db,
+            recipients,
+            build_payload(
+                event=PushEvent.EXPENSE_UPDATED,
+                actor_name=current_user.display_name or current_user.username,
+                ledger_name=ledger.name,
+                ledger_id=str(expense.ledger_id),
+                expense_name=expense.title,
+                expense_id=str(expense.id),
+            ),
+        )
+
+    return expense
 
 
 @router.get("/ledgers/{ledger_id}/expenses", response_model=List[ExpenseWithDetails])
