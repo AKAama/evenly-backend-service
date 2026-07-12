@@ -610,17 +610,16 @@ def get_ledger_overview(
         )
         for member in registered_members
     }
-    from app.services.settlement import balance_sign_for_kind
+    from app.services.settlement import expense_net_amount, expense_scaled_split_amounts
 
     for expense in expenses:
         if expense.status != ExpenseStatus.CONFIRMED:
             continue
-        sign = balance_sign_for_kind(getattr(expense, "kind", None))
         if expense.payer_id in balances:
-            balances[expense.payer_id] += sign * Decimal(str(expense.total_amount))
-        for split in expense.splits:
+            balances[expense.payer_id] += expense_net_amount(expense)
+        for split, amount in expense_scaled_split_amounts(expense):
             if split.user_id in balances:
-                balances[split.user_id] -= sign * Decimal(str(split.amount))
+                balances[split.user_id] -= amount
     creditors = sorted(
         [(user_id, amount) for user_id, amount in balances.items() if amount > 0],
         key=lambda item: item[1],
@@ -923,12 +922,8 @@ def member_has_history(db: Session, ledger_id: UUID, membership: LedgerMember) -
 
 
 def member_balance(db: Session, ledger_id: UUID, membership: LedgerMember) -> Decimal:
-    """Return signed paid - owed + settled for a member across non-rejected entries.
-
-    Income entries invert paid/owed signs so winnings held by one person
-    correctly create payouts to co-participants.
-    """
-    from app.services.settlement import balance_sign_for_kind
+    """Return signed paid - owed + settled for a member across non-rejected entries."""
+    from app.services.settlement import expense_net_amount, expense_scaled_split_amounts
 
     net = Decimal("0")
     rows = (
@@ -941,14 +936,13 @@ def member_balance(db: Session, ledger_id: UUID, membership: LedgerMember) -> De
         .all()
     )
     for expense in rows:
-        sign = balance_sign_for_kind(getattr(expense, "kind", None))
         if membership.user_id is not None and expense.payer_id == membership.user_id:
-            net += sign * Decimal(str(expense.total_amount))
-        for split in expense.splits:
+            net += expense_net_amount(expense)
+        for split, amount in expense_scaled_split_amounts(expense):
             if split.member_id == membership.id or (
                 membership.user_id is not None and split.user_id == membership.user_id
             ):
-                net -= sign * Decimal(str(split.amount))
+                net -= amount
 
     if membership.user_id is None:
         return net

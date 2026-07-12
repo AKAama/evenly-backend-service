@@ -25,35 +25,27 @@ class ExpenseStatus(str, enum.Enum):
     REJECTED = "rejected"
 
 
-class ExpenseKind(str, enum.Enum):
-    """expense: money out (cost). income: money in (winnings, refunds)."""
-
-    EXPENSE = "expense"
-    INCOME = "income"
-
-
 class Expense(Base):
     __tablename__ = "expenses"
     __table_args__ = (
         CheckConstraint("total_amount > 0", name="ck_expenses_total_amount_positive"),
+        CheckConstraint("refund_amount >= 0", name="ck_expenses_refund_amount_non_negative"),
+        CheckConstraint("refund_amount < total_amount", name="ck_expenses_refund_lt_total"),
         CheckConstraint(
             "(icon_type IS NULL AND icon_value IS NULL) OR "
             "(icon_type IN ('sf_symbol', 'emoji') AND icon_value IS NOT NULL)",
             name="ck_expenses_icon_pair",
         ),
-        CheckConstraint("kind IN ('expense', 'income')", name="ck_expenses_kind"),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     ledger_id = Column(UUID(as_uuid=True), ForeignKey("ledgers.id", ondelete="CASCADE"), nullable=False)
-    # Expense: who paid. Income: who received the money (e.g. lottery prize holder).
     payer_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     title = Column(String(255))
     total_amount = Column(Numeric(12, 2), nullable=False)
-    kind = Column(String(20), nullable=False, default=ExpenseKind.EXPENSE.value, server_default="expense")
-    # Optional link for multi-part bills (e.g. lottery cost + prize shown as one card).
-    group_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    # Partial refund from merchant/etc. Effective spend = total_amount - refund_amount.
+    refund_amount = Column(Numeric(12, 2), nullable=False, default=0, server_default="0")
     note = Column(Text)
     category = Column(String(50), nullable=True)
     icon_type = Column(String(20), nullable=True)

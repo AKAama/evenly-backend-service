@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from time import perf_counter
-from uuid import UUID, uuid4
+from uuid import UUID
 from decimal import Decimal
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.encoders import jsonable_encoder
@@ -18,8 +18,7 @@ from app.schemas.expense import (
     ExpenseResponse,
     ExpenseWithDetails,
     ExpenseSplitCreate,
-    CompoundExpenseCreate,
-    CompoundExpenseResponse,
+    ExpenseRefundRequest,
     ConfirmExpenseRequest,
     VoiceExpenseDraft,
     expense_to_with_details,
@@ -155,6 +154,29 @@ def get_websocket_user(websocket: WebSocket, db: Session) -> User | None:
     if token_data is None or token_data.user_id is None:
         return None
     return get_user_by_id(db, token_data.user_id)
+
+
+@router.get("/ledgers/{ledger_id}/voice-session")
+def voice_session_requires_websocket(ledger_id: UUID):
+    """HTTP GET hits this when the reverse proxy failed to upgrade to WebSocket.
+
+    Uvicorn then sees a plain GET (often over HTTP/1.0) and would otherwise 404
+    because only a WebSocket route exists. Surface a clear ops-facing message.
+    """
+    logger.warning(
+        "voice-session 收到普通 HTTP GET（非 WebSocket 升级）ledger_id=%s — "
+        "请检查 Nginx: proxy_http_version 1.1 + Upgrade/Connection 头",
+        ledger_id,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_426_UPGRADE_REQUIRED,
+        detail=(
+            "voice-session 需要 WebSocket。若 App 报 bad response / 404，"
+            "请配置反向代理: proxy_http_version 1.1，"
+            "并转发 Upgrade / Connection 头（见 docs/nginx-websocket.md）。"
+        ),
+        headers={"Upgrade": "websocket"},
+    )
 
 
 @router.websocket("/ledgers/{ledger_id}/voice-session")
@@ -499,7 +521,6 @@ def create_expense(
         payload=expense,
         created_by=current_user.id,
         resolved_splits=resolved_splits,
-        group_id=expense.group_id,
         commit=True,
     )
 
@@ -515,17 +536,6 @@ def create_expense(
         ))
 
     return db_expense
-
-
-def _equal_splits(total: Decimal, member_ids: list[UUID]) -> list[ExpenseSplitCreate]:
-    n = len(member_ids)
-    cents = int((total * 100).to_integral_value())
-    base, rem = divmod(cents, n)
-    splits: list[ExpenseSplitCreate] = []
-    for i, mid in enumerate(member_ids):
-        part = base + (1 if i < rem else 0)
-        splits.append(ExpenseSplitCreate(member_id=mid, amount=Decimal(part) / 100))
-    return splits
 
 
 def _required_participants_for(resolved_splits, created_by, payer_id) -> set:
@@ -544,7 +554,6 @@ def _persist_expense_row(
     payload: ExpenseCreate,
     created_by,
     resolved_splits,
-    group_id=None,
     commit: bool = True,
 ) -> Expense:
     db_expense = Expense(
@@ -553,8 +562,6 @@ def _persist_expense_row(
         created_by=created_by,
         title=payload.title,
         total_amount=payload.total_amount,
-        kind=payload.kind,
-        group_id=group_id if group_id is not None else payload.group_id,
         note=payload.note,
         category=payload.category,
         icon_type=payload.icon_type,
@@ -605,106 +612,6 @@ def _persist_expense_row(
     return db_expense
 
 
-@router.post(
-    "/ledgers/{ledger_id}/expenses/compound",
-    response_model=CompoundExpenseResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_compound_expense(
-    ledger_id: UUID,
-    body: CompoundExpenseCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Create linked cost (expense) + income rows that appear as one bill in clients."""
-    ledger = get_ledger_or_404(db, ledger_id)
-    require_ledger_member(db, ledger_id, current_user)
-
-    member_ids = list(dict.fromkeys(body.participant_member_ids))  # preserve order, unique
-    if len(member_ids) < 1:
-        raise HTTPException(status_code=400, detail="At least one participant is required")
-
-    cost_splits = _equal_splits(body.cost_amount, member_ids)
-    income_splits = _equal_splits(body.income_amount, member_ids)
-    group_id = uuid4()
-
-    cost_payload = ExpenseCreate(
-        title=body.title,
-        total_amount=body.cost_amount,
-        kind="expense",
-        note=body.note,
-        expense_date=body.expense_date,
-        category=body.category,
-        icon_type=body.icon_type,
-        icon_value=body.icon_value,
-        payer_id=body.cost_payer_id,
-        splits=cost_splits,
-        group_id=group_id,
-    )
-    income_payload = ExpenseCreate(
-        title=body.title,
-        total_amount=body.income_amount,
-        kind="income",
-        note=body.note,
-        expense_date=body.expense_date,
-        category=body.category,
-        icon_type=body.icon_type,
-        icon_value=body.icon_value,
-        payer_id=body.income_receiver_id,
-        splits=income_splits,
-        group_id=group_id,
-    )
-
-    cost_resolved, _ = _resolve_expense_splits(ledger_id=ledger_id, payload=cost_payload, db=db)
-    income_resolved, _ = _resolve_expense_splits(ledger_id=ledger_id, payload=income_payload, db=db)
-
-    cost_row = _persist_expense_row(
-        db=db,
-        ledger_id=ledger_id,
-        payload=cost_payload,
-        created_by=current_user.id,
-        resolved_splits=cost_resolved,
-        group_id=group_id,
-        commit=False,
-    )
-    income_row = _persist_expense_row(
-        db=db,
-        ledger_id=ledger_id,
-        payload=income_payload,
-        created_by=current_user.id,
-        resolved_splits=income_resolved,
-        group_id=group_id,
-        commit=False,
-    )
-    db.commit()
-    db.refresh(cost_row)
-    db.refresh(income_row)
-
-    notify_ids = (
-        _required_participants_for(cost_resolved, current_user.id, body.cost_payer_id)
-        | _required_participants_for(income_resolved, current_user.id, body.income_receiver_id)
-    )
-    if notify_ids:
-        send_push_safely(
-            db,
-            notify_ids,
-            build_payload(
-                event=PushEvent.EXPENSE_CREATED,
-                actor_name=current_user.display_name or current_user.username,
-                ledger_name=ledger.name,
-                ledger_id=str(ledger_id),
-                expense_name=body.title,
-                expense_id=str(cost_row.id),
-            ),
-        )
-
-    return CompoundExpenseResponse(
-        group_id=group_id,
-        cost=ExpenseResponse.model_validate(cost_row),
-        income=ExpenseResponse.model_validate(income_row),
-    )
-
-
 @router.put("/{expense_id}", response_model=ExpenseResponse)
 def update_expense(
     expense_id: UUID,
@@ -734,7 +641,8 @@ def update_expense(
 
     expense.title = payload.title
     expense.total_amount = payload.total_amount
-    expense.kind = payload.kind
+    # Full edit replaces the bill; clear any prior refund so splits stay consistent.
+    expense.refund_amount = Decimal("0")
     expense.note = payload.note
     expense.category = payload.category
     expense.icon_type = payload.icon_type
@@ -795,6 +703,83 @@ def update_expense(
         send_push_safely(
             db,
             recipients,
+            build_payload(
+                event=PushEvent.EXPENSE_UPDATED,
+                actor_name=current_user.display_name or current_user.username,
+                ledger_name=ledger.name,
+                ledger_id=str(expense.ledger_id),
+                expense_name=expense.title,
+                expense_id=str(expense.id),
+
+            ),
+        )
+
+    return expense
+
+
+@router.patch("/{expense_id}/refund", response_model=ExpenseResponse)
+def set_expense_refund(
+    expense_id: UUID,
+    payload: ExpenseRefundRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Record a partial refund (e.g. hotel refunded ¥100 of a ¥600 stay).
+
+    Does not change original total_amount or per-person splits; settlement
+    uses total_amount - refund_amount and proportionally scales shares.
+    Allowed for non-rejected expenses; creator or payer can update.
+    """
+    expense = (
+        db.query(Expense)
+        .options(selectinload(Expense.splits), selectinload(Expense.confirmations))
+        .filter(Expense.id == expense_id)
+        .first()
+    )
+    if not expense:
+        raise HTTPException(status_code=404, detail="Expense not found")
+
+    require_ledger_member(db, expense.ledger_id, current_user)
+    if current_user.id not in {expense.created_by, expense.payer_id}:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the expense creator or payer can record a refund",
+        )
+    if expense.status == ExpenseStatus.REJECTED:
+        raise HTTPException(status_code=400, detail="Cannot refund a rejected expense")
+
+    refund = normalize_money(payload.refund_amount)
+    total = normalize_money(expense.total_amount)
+    if refund < 0:
+        raise HTTPException(status_code=400, detail="refund_amount must be >= 0")
+    if refund >= total:
+        raise HTTPException(
+            status_code=400,
+            detail="refund_amount must be less than the original total_amount",
+        )
+
+    expense.refund_amount = refund
+    if payload.note is not None:
+        # Append refund context without wiping an existing note.
+        note = (payload.note or "").strip()
+        if note:
+            existing = (expense.note or "").strip()
+            tag = f"退款 ¥{refund}"
+            if note not in existing:
+                expense.note = f"{existing}\n{tag}：{note}".strip() if existing else f"{tag}：{note}"
+            elif tag not in existing:
+                expense.note = f"{existing}\n{tag}".strip()
+
+    db.commit()
+    db.refresh(expense)
+
+    ledger = get_ledger_or_404(db, expense.ledger_id)
+    participant_ids = {s.user_id for s in expense.splits if s.user_id is not None}
+    notify = participant_ids - {current_user.id}
+    if notify:
+        send_push_safely(
+            db,
+            notify,
             build_payload(
                 event=PushEvent.EXPENSE_UPDATED,
                 actor_name=current_user.display_name or current_user.username,

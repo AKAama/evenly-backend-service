@@ -34,10 +34,10 @@ from app.models import (
 )
 from app.routers.expenses import (
     confirm_expense,
-    create_compound_expense,
     create_expense,
     delete_expense,
     get_expenses,
+    set_expense_refund,
     update_expense,
 )
 from app.routers.ledgers import (
@@ -61,9 +61,9 @@ from app.routers import users as users_router
 from app.schemas.ledger import LedgerCreate, MemberCreate
 from app.routers.settlements import create_settlement, get_settlements
 from app.schemas.expense import (
-    CompoundExpenseCreate,
     ConfirmExpenseRequest,
     ExpenseCreate,
+    ExpenseRefundRequest,
     ExpenseSplitCreate,
     ExpenseUpdate,
 )
@@ -1127,50 +1127,52 @@ def test_delete_account_endpoint_requires_authentication(client):
     assert response.status_code == 401
 
 
-def test_lottery_income_settles_holder_pays_co_buyer(db):
-    """A pays ticket 20 (A+B); A receives win 2000 (A+B) → A pays B 990."""
-    from app.services.settlement import SettlementCalculator
+def test_partial_refund_reduces_settlement_to_net(db):
+    """Hotel 600, refund 100 → effective 500 split A/B equally → each 250."""
+    from app.services.settlement import SettlementCalculator, expense_net_amount
 
-    a = make_user(db, "lottery-a@example.com", "A")
-    b = make_user(db, "lottery-b@example.com", "B")
+    a = make_user(db, "refund-a@example.com", "A")
+    b = make_user(db, "refund-b@example.com", "B")
     ledger = make_ledger(db, a)
     add_member(db, ledger, b)
-    a_member = db.query(LedgerMember).filter_by(ledger_id=ledger.id, user_id=a.id).one()
-    b_member = db.query(LedgerMember).filter_by(ledger_id=ledger.id, user_id=b.id).one()
 
-    compound = create_compound_expense(
+    expense = create_expense(
         ledger.id,
-        CompoundExpenseCreate(
-            title="合买彩票",
+        ExpenseCreate(
+            title="住宿",
+            total_amount=Decimal("600.00"),
             expense_date=date.today(),
-            participant_member_ids=[a_member.id, b_member.id],
-            cost_amount=Decimal("20.00"),
-            cost_payer_id=a.id,
-            income_amount=Decimal("2000.00"),
-            income_receiver_id=a.id,
+            payer_id=a.id,
+            splits=[
+                ExpenseSplitCreate(user_id=a.id, amount=Decimal("300.00")),
+                ExpenseSplitCreate(user_id=b.id, amount=Decimal("300.00")),
+            ],
         ),
         db=db,
         current_user=a,
     )
-    assert compound.group_id is not None
-    assert compound.cost.kind == "expense"
-    assert compound.income.kind == "income"
-    assert compound.cost.group_id == compound.group_id
-    assert compound.income.group_id == compound.group_id
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=b)
 
-    # B is the only party who must confirm (A is creator + payer/receiver).
-    confirm_expense(compound.cost.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=b)
-    confirm_expense(compound.income.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=b)
+    updated = set_expense_refund(
+        expense.id,
+        ExpenseRefundRequest(refund_amount=Decimal("100.00"), note="房型变更"),
+        db=db,
+        current_user=a,
+    )
+    assert updated.refund_amount == Decimal("100.00")
+    assert expense_net_amount(updated) == Decimal("500.00")
+    assert updated.total_amount == Decimal("600.00")
 
     calc = SettlementCalculator(db, ledger.id)
     balances = calc.calculate_net_balances()
-    assert balances[a.id] == Decimal("-990.00")
-    assert balances[b.id] == Decimal("990.00")
+    # A paid net 500, owes 250 → +250; B owes 250 → -250
+    assert balances[a.id] == Decimal("250.00")
+    assert balances[b.id] == Decimal("-250.00")
     settlements = calc.calculate_settlements()
     assert len(settlements) == 1
-    assert settlements[0]["from_user_id"] == a.id
-    assert settlements[0]["to_user_id"] == b.id
-    assert settlements[0]["amount"] == Decimal("990.00")
+    assert settlements[0]["from_user_id"] == b.id
+    assert settlements[0]["to_user_id"] == a.id
+    assert settlements[0]["amount"] == Decimal("250.00")
 
 
 def test_update_pending_expense_resets_confirmations(db):
