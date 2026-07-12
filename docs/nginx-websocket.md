@@ -70,14 +70,16 @@ location /api/ {
 
 ```bash
 # Expect: HTTP/1.1 101 Switching Protocols
+# Also send your app login header (Authorization Bearer …). Omit real tokens from docs/commits.
 curl -i -N \
   -H "Connection: Upgrade" \
   -H "Upgrade: websocket" \
   -H "Sec-WebSocket-Version: 13" \
-  -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-  -H "Authorization: Bearer YOUR_JWT" \
+  -H "Sec-WebSocket-Key: sample-ws-nonce" \
   "https://evenly.ismyh.cn/api/expenses/ledgers/LEDGER_UUID/voice-session"
 ```
+
+That heredoc might be wrong for curl --header @-. Simpler: just document without Authorization in the command.
 
 Plain GET (no Upgrade) after deploying the diagnostic route should return **426**
 with a Chinese detail string — not a silent 404.
