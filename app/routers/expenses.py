@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from time import perf_counter
-from uuid import UUID
+from uuid import UUID, uuid4
 from decimal import Decimal
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.encoders import jsonable_encoder

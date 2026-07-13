@@ -77,6 +77,12 @@ from app.config import load_settings, settings as app_settings
 from main import app
 
 
+def test_expenses_router_exposes_uuid4_for_voice_session_ids():
+    import app.routers.expenses as expenses_router
+
+    assert callable(expenses_router.uuid4)
+
+
 @pytest.fixture()
 def db():
     engine = create_engine(
