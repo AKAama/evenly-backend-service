@@ -59,7 +59,12 @@ class Expense(Base):
     ledger = relationship("Ledger", back_populates="expenses")
     payer = relationship("User", back_populates="expenses_paid", foreign_keys=[payer_id])
     creator = relationship("User", back_populates="expenses_created", foreign_keys=[created_by])
-    splits = relationship("ExpenseSplit", back_populates="expense", cascade="all, delete-orphan")
+    splits = relationship(
+        "ExpenseSplit",
+        back_populates="expense",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     confirmations = relationship("ExpenseConfirmation", back_populates="expense", cascade="all, delete-orphan")
 
 
@@ -73,7 +78,11 @@ class ExpenseSplit(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     expense_id = Column(UUID(as_uuid=True), ForeignKey("expenses.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
-    member_id = Column(UUID(as_uuid=True), ForeignKey("ledger_members.id"), nullable=False)
+    member_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("ledger_members.id", ondelete="CASCADE"),
+        nullable=False,
+    )
     amount = Column(Numeric(12, 2), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 

@@ -4,6 +4,7 @@ import logging
 import sys
 import types
 import uuid
+import warnings
 import textwrap
 from pathlib import Path
 from io import BytesIO
@@ -15,7 +16,7 @@ from pydantic import ValidationError
 from fastapi import HTTPException
 from starlette.datastructures import Headers, UploadFile
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -44,6 +45,7 @@ from app.routers.ledgers import (
     accept_invitation,
     add_member as add_member_endpoint,
     create_ledger,
+    delete_ledger,
     get_ledger,
     get_ledger_overview,
     get_ledgers,
@@ -168,6 +170,48 @@ def make_ledger(db, owner, *, with_temp_member=False):
         ))
     db.commit()
     return ledger
+
+
+def test_delete_ledger_cascades_member_linked_expense_splits(db):
+    db.execute(text("PRAGMA foreign_keys=ON"))
+    owner = make_user(db, "delete-ledger@example.com", "Owner")
+    ledger = make_ledger(db, owner)
+    member = db.query(LedgerMember).filter_by(
+        ledger_id=ledger.id,
+        user_id=owner.id,
+    ).one()
+    expense = Expense(
+        ledger_id=ledger.id,
+        payer_id=owner.id,
+        created_by=owner.id,
+        title="Dinner",
+        total_amount=Decimal("10.00"),
+        expense_date=date.today(),
+        status=ExpenseStatus.CONFIRMED,
+    )
+    db.add(expense)
+    db.flush()
+    db.add(ExpenseSplit(
+        expense_id=expense.id,
+        user_id=owner.id,
+        member_id=member.id,
+        amount=Decimal("10.00"),
+    ))
+    db.commit()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        delete_ledger(ledger.id, db=db, current_user=owner)
+
+    assert not any(
+        "DELETE statement on table 'expense_splits' expected to delete" in str(item.message)
+        for item in caught
+    )
+
+    assert db.query(Ledger).filter_by(id=ledger.id).count() == 0
+    assert db.query(LedgerMember).filter_by(ledger_id=ledger.id).count() == 0
+    assert db.query(Expense).filter_by(ledger_id=ledger.id).count() == 0
+    assert db.query(ExpenseSplit).filter_by(expense_id=expense.id).count() == 0
 
 
 def test_settings_layer_defaults_local_config_and_environment(tmp_path, monkeypatch):
