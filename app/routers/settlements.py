@@ -1,5 +1,5 @@
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import joinedload, Session
 from typing import List
 
@@ -14,6 +14,12 @@ from app.schemas.settlement import (
 from app.schemas.user import UserResponse
 from app.services.settlement import SettlementCalculator, create_settlement_record
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
+
+
+def _x_client_source(x_client) -> str:
+    if isinstance(x_client, str) and x_client.strip():
+        return x_client.strip().lower()
+    return "api"
 
 router = APIRouter(prefix="/ledgers", tags=["settlements"])
 
@@ -89,7 +95,8 @@ def create_settlement(
     ledger_id: UUID,
     settlement: SettlementCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
 ):
     """Record a settlement (payment)"""
     # Check if ledger exists and user is a member
@@ -126,6 +133,20 @@ def create_settlement(
         to_user_id=settlement.to_user_id,
         amount=settlement.amount,
         note=settlement.note,
+    )
+
+    from app.services.audit import record_audit
+
+    record_audit(
+        db,
+        action="settlement.create",
+        actor=current_user,
+        resource_type="settlement",
+        resource_id=db_settlement.id,
+        ledger_id=ledger_id,
+        summary=f"记录转账 ¥{settlement.amount}",
+        metadata={"amount": str(settlement.amount)},
+        source=_x_client_source(x_client),
     )
 
     return db_settlement

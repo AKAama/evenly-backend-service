@@ -2262,3 +2262,62 @@ def test_settlement_excludes_pending_members(db):
     assert suggestions[0].from_user_id == friend.id
     assert suggestions[0].to_user_id == owner.id
     assert suggestions[0].amount == Decimal("30.00")
+
+
+def test_audit_event_recorded_on_expense_create(db):
+    from app.models.audit import AuditEvent
+    from app.services.audit import is_user_admin
+
+    owner = make_user(db, "audit-owner@example.com", "AuditOwner")
+    # Regular app users are never admins; audit is still written for their actions.
+    assert not is_user_admin(owner)
+    ledger = make_ledger(db, owner)
+    create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="咖啡",
+            total_amount=Decimal("18.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[ExpenseSplitCreate(user_id=owner.id, amount=Decimal("18.00"))],
+        ),
+        db=db,
+        current_user=owner,
+        x_client="ios",
+    )
+    row = db.query(AuditEvent).filter(AuditEvent.action == "expense.create").order_by(AuditEvent.created_at.desc()).first()
+    assert row is not None
+    assert row.source == "ios"
+    assert row.actor_user_id == owner.id
+    assert "咖啡" in (row.summary or "")
+
+
+def test_platform_user_cannot_create_ledger(db):
+    from fastapi import HTTPException
+    from app.routers.platform_users import create_platform_user_record
+    from app.schemas.user import PlatformUserCreate
+    from app.schemas.ledger import LedgerCreate
+    from app.routers.ledgers import create_ledger
+
+    ops = create_platform_user_record(
+        db,
+        PlatformUserCreate(
+            email="ops@example.com",
+            username="ops_admin",
+            password="password123",
+            display_name="运营",
+        ),
+    )
+    assert ops.account_kind == "platform"
+    assert ops.is_admin is True
+
+    try:
+        create_ledger(
+            LedgerCreate(name="ShouldFail", currency="CNY", members=[]),
+            db=db,
+            current_user=ops,
+            x_client="console",
+        )
+        assert False, "expected HTTPException"
+    except HTTPException as exc:
+        assert exc.status_code == 403

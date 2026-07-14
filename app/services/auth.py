@@ -105,6 +105,8 @@ def create_user(db: Session, user: UserCreate) -> User:
         password_hash=hashed_password,
         display_name=user.display_name,
         avatar_url=user.avatar_url,
+        account_kind="app",
+        is_admin=False,
     )
     db.add(db_user)
     db.flush()

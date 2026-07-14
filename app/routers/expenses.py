@@ -4,7 +4,7 @@ import logging
 from time import perf_counter
 from uuid import UUID, uuid4
 from decimal import Decimal
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import joinedload, selectinload, Session
 from typing import List
@@ -33,6 +33,12 @@ from app.services.voice_expense import (
 from app.services.push import PushEvent, build_payload, send_push_safely
 from app.services.rate_limit import allow_request, enforce_rate_limit
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
+
+
+def _x_client_source(x_client) -> str:
+    if isinstance(x_client, str) and x_client.strip():
+        return x_client.strip().lower()
+    return "api"
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 logger = logging.getLogger(__name__)
@@ -501,7 +507,8 @@ def create_expense(
     ledger_id: UUID,
     expense: ExpenseCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
 ):
     """Create a new expense in a ledger"""
     # Check if ledger exists and user is a member
@@ -534,6 +541,20 @@ def create_expense(
             expense_name=db_expense.title,
             expense_id=str(db_expense.id),
         ))
+
+    from app.services.audit import record_audit
+
+    record_audit(
+        db,
+        action="expense.create",
+        actor=current_user,
+        resource_type="expense",
+        resource_id=db_expense.id,
+        ledger_id=ledger_id,
+        summary=f"记一笔「{db_expense.title}」¥{db_expense.total_amount}",
+        metadata={"total_amount": str(db_expense.total_amount)},
+        source=_x_client_source(x_client),
+    )
 
     return db_expense
 
@@ -723,6 +744,7 @@ def set_expense_refund(
     payload: ExpenseRefundRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
 ):
     """Record a partial refund (e.g. hotel refunded ¥100 of a ¥600 stay).
 
@@ -790,6 +812,20 @@ def set_expense_refund(
             ),
         )
 
+    from app.services.audit import record_audit
+
+    record_audit(
+        db,
+        action="expense.refund",
+        actor=current_user,
+        resource_type="expense",
+        resource_id=expense.id,
+        ledger_id=expense.ledger_id,
+        summary=f"退款「{expense.title}」¥{refund}（原价 ¥{total}）",
+        metadata={"refund_amount": str(refund), "total_amount": str(total)},
+        source=_x_client_source(x_client),
+    )
+
     return expense
 
 
@@ -851,7 +887,8 @@ def confirm_expense(
     expense_id: UUID,
     request: ConfirmExpenseRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
 ):
     """Confirm or reject an expense"""
     expense = db.query(Expense).filter(Expense.id == expense_id).first()
@@ -925,6 +962,19 @@ def confirm_expense(
     db.commit()
     db.refresh(expense)
 
+    from app.services.audit import record_audit
+
+    record_audit(
+        db,
+        action=f"expense.{request.status}",
+        actor=current_user,
+        resource_type="expense",
+        resource_id=expense.id,
+        ledger_id=expense.ledger_id,
+        summary=f"{'确认' if request.status == 'confirmed' else '拒绝'}账单「{expense.title}」",
+        source=_x_client_source(x_client),
+    )
+
     if expense.created_by != current_user.id:
         ledger = get_ledger_or_404(db, expense.ledger_id)
         event = PushEvent.EXPENSE_CONFIRMED if request.status == "confirmed" else PushEvent.EXPENSE_REJECTED
@@ -944,17 +994,25 @@ def confirm_expense(
 def reject_expense(
     expense_id: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
 ):
     """Reject an expense (alias for confirm with rejected status)"""
-    return confirm_expense(expense_id, ConfirmExpenseRequest(status="rejected"), db, current_user)
+    return confirm_expense(
+        expense_id,
+        ConfirmExpenseRequest(status="rejected"),
+        db=db,
+        current_user=current_user,
+        x_client=x_client,
+    )
 
 
 @router.delete("/{expense_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_expense(
     expense_id: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
 ):
     """Delete an expense (creator or ledger owner)."""
     expense = db.query(Expense).filter(Expense.id == expense_id).first()
@@ -971,8 +1029,22 @@ def delete_expense(
             detail="Only the expense creator or ledger owner can delete this expense",
         )
 
+    title = expense.title
+    ledger_id = expense.ledger_id
     db.delete(expense)
     db.commit()
+    from app.services.audit import record_audit
+
+    record_audit(
+        db,
+        action="expense.delete",
+        actor=current_user,
+        resource_type="expense",
+        resource_id=expense_id,
+        ledger_id=ledger_id,
+        summary=f"删除账单「{title}」",
+        source=_x_client_source(x_client),
+    )
     return None
 
 

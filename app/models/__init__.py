@@ -2,6 +2,7 @@ from app.models.user import AuthIdentity, PushDevice, User
 from app.models.ledger import Ledger, LedgerInviteLink, LedgerMember
 from app.models.expense import Expense, ExpenseSplit, ExpenseConfirmation, ExpenseStatus
 from app.models.settlement import Settlement
+from app.models.audit import AuditEvent
 
 __all__ = [
     "User",
@@ -15,4 +16,5 @@ __all__ = [
     "ExpenseConfirmation",
     "ExpenseStatus",
     "Settlement",
+    "AuditEvent",
 ]

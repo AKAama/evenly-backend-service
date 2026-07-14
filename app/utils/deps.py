@@ -55,7 +55,18 @@ def get_ledger_or_404(db: Session, ledger_id) -> Ledger:
     return ledger
 
 
+def require_app_user(current_user: User) -> User:
+    """Reject platform ops accounts on consumer (ledger) APIs."""
+    from app.services.audit import reject_if_platform_for_app
+
+    reject_if_platform_for_app(current_user)
+    return current_user
+
+
 def require_ledger_member(db: Session, ledger_id, current_user: User) -> LedgerMember:
+    from app.services.audit import reject_if_platform_for_app
+
+    reject_if_platform_for_app(current_user)
     membership = db.query(LedgerMember).filter(
         LedgerMember.ledger_id == ledger_id,
         LedgerMember.user_id == current_user.id,

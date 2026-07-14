@@ -101,6 +101,7 @@ def verify(email: str, code: str):
 
 @router.post("/register", response_model=RegisterResponse)
 async def register(
+    request: Request,
     response: Response,
     email: Annotated[str, Form()],
     password: Annotated[str, Form()],
@@ -195,8 +196,18 @@ async def register(
     )
     set_auth_cookie(response, access_token)
 
-    # Convert to response model
-    user_response = UserResponse.model_validate(db_user)
+    from app.services.audit import record_audit, user_to_response
+
+    user_response = user_to_response(db_user)
+    record_audit(
+        db,
+        action="auth.register",
+        actor=db_user,
+        resource_type="user",
+        resource_id=db_user.id,
+        summary=f"注册 {db_user.username}",
+        request=request,
+    )
     return RegisterResponse(
         **user_response.model_dump(),
         access_token=access_token
@@ -235,6 +246,19 @@ def login(
         expires_delta=timedelta(minutes=settings.jwt_expire_minutes)
     )
     set_auth_cookie(response, access_token)
+
+    from app.services.audit import record_audit
+
+    is_platform = getattr(user, "account_kind", None) == "platform"
+    record_audit(
+        db,
+        action="auth.login",
+        actor=user,
+        resource_type="user",
+        resource_id=user.id,
+        summary=f"登录 {user.username}" + ("（平台账号）" if is_platform else ""),
+        request=request,
+    )
 
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -300,6 +324,17 @@ def login_with_apple(
         expires_delta=timedelta(minutes=settings.jwt_expire_minutes),
     )
     set_auth_cookie(response, access_token)
+    from app.services.audit import record_audit
+
+    record_audit(
+        db,
+        action="auth.apple_login",
+        actor=user,
+        resource_type="user",
+        resource_id=user.id,
+        summary=f"Apple 登录 {user.username}",
+        request=http_request,
+    )
     return {"access_token": access_token, "token_type": "bearer"}
 
 

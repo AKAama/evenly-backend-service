@@ -3,7 +3,7 @@ import secrets
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import joinedload, Session
 from typing import List
@@ -41,6 +41,12 @@ from app.schemas.user import UserResponse
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 from app.services.push import PushEvent, build_payload, send_push_safely
 from app.services import invitation_cache
+
+
+def _x_client_source(x_client) -> str:
+    if isinstance(x_client, str) and x_client.strip():
+        return x_client.strip().lower()
+    return "api"
 
 router = APIRouter(prefix="/ledgers", tags=["ledgers"])
 logger = logging.getLogger(__name__)
@@ -102,9 +108,13 @@ def _get_active_link_by_token(db: Session, token: str) -> tuple[LedgerInviteLink
 def create_ledger(
     ledger: LedgerCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
 ):
     """Create a new ledger and add the creator as owner member"""
+    from app.services.audit import reject_if_platform_for_app
+
+    reject_if_platform_for_app(current_user)
     logger.info(
         "Creating ledger name=%s owner_id=%s initial_members=%d",
         ledger.name,
@@ -220,6 +230,19 @@ def create_ledger(
         created_at=db_ledger.created_at,
         updated_at=db_ledger.updated_at,
         members=all_members
+    )
+
+    from app.services.audit import record_audit
+
+    record_audit(
+        db,
+        action="ledger.create",
+        actor=current_user,
+        resource_type="ledger",
+        resource_id=db_ledger.id,
+        ledger_id=db_ledger.id,
+        summary=f"创建账本「{db_ledger.name}」",
+        source=_x_client_source(x_client),
     )
     
     return response
@@ -368,8 +391,12 @@ def join_via_invite_link(
     token: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
 ):
     """Join a ledger via QR / Universal Link. Authenticated user becomes an active member."""
+    from app.services.audit import reject_if_platform_for_app
+
+    reject_if_platform_for_app(current_user)
     link, ledger = _get_active_link_by_token(db, token)
 
     existing = (
@@ -393,6 +420,18 @@ def join_via_invite_link(
         db.commit()
         db.refresh(existing)
         invitation_cache.invalidate_pending_invitations(current_user.id)
+        from app.services.audit import record_audit
+
+        record_audit(
+            db,
+            action="ledger.join_invite",
+            actor=current_user,
+            resource_type="ledger",
+            resource_id=ledger.id,
+            ledger_id=ledger.id,
+            summary=f"通过邀请链接加入「{ledger.name}」",
+            source=_x_client_source(x_client),
+        )
         return JoinLedgerResponse(
             ledger_id=ledger.id,
             ledger_name=ledger.name,
@@ -414,6 +453,18 @@ def join_via_invite_link(
         ledger.id,
         current_user.id,
         token[:6],
+    )
+    from app.services.audit import record_audit
+
+    record_audit(
+        db,
+        action="ledger.join_invite",
+        actor=current_user,
+        resource_type="ledger",
+        resource_id=ledger.id,
+        ledger_id=ledger.id,
+        summary=f"通过邀请链接加入「{ledger.name}」",
+        source=_x_client_source(x_client),
     )
     return JoinLedgerResponse(
         ledger_id=ledger.id,

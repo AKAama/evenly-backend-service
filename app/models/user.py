@@ -17,8 +17,16 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     display_name = Column(String(100))
     avatar_url = Column(String)
+    # app = normal Evenly user; platform = ops-only console account (no ledger membership).
+    account_kind = Column(String(20), nullable=False, default="app", server_default="app")
+    # Legacy flag kept for DB compatibility; console admin is decided by account_kind=platform.
+    is_admin = Column(Boolean, nullable=False, default=False, server_default="false")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    @property
+    def is_platform(self) -> bool:
+        return (self.account_kind or "app") == "platform"
 
     # Relationships
     ledgers = relationship("Ledger", back_populates="owner", cascade="all, delete-orphan")

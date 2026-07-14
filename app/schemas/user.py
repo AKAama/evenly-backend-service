@@ -33,6 +33,19 @@ class UserResponse(UserBase):
 
     id: UUID
     created_at: datetime
+    # app | platform (platform = ops console only).
+    account_kind: str = "app"
+    # True only for platform ops accounts (account_kind=platform).
+    is_admin: bool = False
+
+
+class PlatformUserCreate(BaseModel):
+    """Create an ops-only console account (not for iOS ledgers)."""
+
+    email: EmailStr
+    username: str = Field(min_length=3, max_length=30)
+    password: str = Field(min_length=8, max_length=128)
+    display_name: str | None = Field(default=None, max_length=100)
 
 
 class Token(BaseModel):
