@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-16 — Ledger confirmation toggle & projected settlements
+
+- Added per-ledger `require_confirmation` (migration `20260716_0021`); default on for existing ledgers.
+- `PATCH /ledgers/{id}` for owners to update name/currency/confirmation; turning confirmation off auto-confirms pending expenses.
+- Creating/updating expenses respects the flag: when off, expenses are confirmed immediately.
+- Settlement flow includes confirmed **and** pending (non-rejected) bills so projected transfers match the fully-confirmed end state.
+- Settlement instructions expose `includes_unconfirmed` when either party still has pending bills.
+- Password change returns Chinese errors, enforces min length, and writes an audit event (console/platform ops).
+
 ## 2026-07-10 — Synchronized expense category icons
 
 - Expenses can persist a category and a validated SF Symbol or Emoji icon.

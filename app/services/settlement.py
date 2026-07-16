@@ -65,16 +65,45 @@ class SettlementCalculator:
         self._members: list[LedgerMember] | None = None
 
     def get_confirmed_expenses(self) -> list[Expense]:
-        """Get expenses approved by every required participant."""
+        """Expenses fully confirmed (legacy helper)."""
         return (
             self.db.query(Expense)
             .options(joinedload(Expense.splits))
             .filter(
                 Expense.ledger_id == self.ledger_id,
-                Expense.status == ExpenseStatus.CONFIRMED
+                Expense.status == ExpenseStatus.CONFIRMED,
             )
             .all()
         )
+
+    def get_settlement_expenses(self) -> list[Expense]:
+        """Expenses that shape transfer flow: confirmed + pending (not rejected).
+
+        Pending bills are projected into the same final flow so amounts stay
+        stable as confirmations complete; clients mark affected rows as unconfirmed.
+        """
+        return (
+            self.db.query(Expense)
+            .options(joinedload(Expense.splits))
+            .filter(
+                Expense.ledger_id == self.ledger_id,
+                Expense.status.in_([ExpenseStatus.CONFIRMED, ExpenseStatus.PENDING]),
+            )
+            .all()
+        )
+
+    def users_involved_in_pending_expenses(self) -> set[UUID]:
+        """Registered users on any still-pending bill (payer or split)."""
+        involved: set[UUID] = set()
+        for expense in self.get_settlement_expenses():
+            if expense.status != ExpenseStatus.PENDING:
+                continue
+            if expense.payer_id is not None:
+                involved.add(expense.payer_id)
+            for split in expense.splits or []:
+                if split.user_id is not None:
+                    involved.add(split.user_id)
+        return involved
 
     def get_ledger_members(self) -> list[LedgerMember]:
         """Get active members of the ledger (pending invitations don't participate in balances)"""
@@ -97,12 +126,15 @@ class SettlementCalculator:
 
         Positive net: user should receive money
         Negative net: user owes money
+
+        Includes pending bills so the projected transfer flow matches the
+        fully-confirmed end state.
         """
         members = self.get_ledger_members()
         member_ids = {m.user_id for m in members if m.user_id is not None}
         net_balances: dict[UUID, Decimal] = {uid: Decimal("0") for uid in member_ids}
 
-        for expense in self.get_confirmed_expenses():
+        for expense in self.get_settlement_expenses():
             if expense.payer_id in net_balances:
                 net_balances[expense.payer_id] += expense_net_amount(expense)
             for split, amount in expense_scaled_split_amounts(expense):
@@ -131,13 +163,15 @@ class SettlementCalculator:
             {
                 "from_user_id": UUID,
                 "to_user_id": UUID,
-                "amount": Decimal
+                "amount": Decimal,
+                "includes_unconfirmed": bool,
             },
             ...
         ]
         """
         net_balances = self.calculate_net_balances()
         user_names = self.get_user_names()
+        pending_users = self.users_involved_in_pending_expenses()
 
         # Separate into creditors (positive balance) and debtors (negative balance)
         creditors: list[tuple[UUID, Decimal]] = []
@@ -165,12 +199,17 @@ class SettlementCalculator:
             transfer_amount = min(creditor_amount, debtor_amount)
 
             if transfer_amount > 0:
+                # Gray / unconfirmed when either side still has open pending bills.
+                includes_unconfirmed = (
+                    debtor_id in pending_users or creditor_id in pending_users
+                )
                 settlements.append({
                     "from_user_id": debtor_id,
                     "from_user_name": user_names.get(debtor_id, "Unknown"),
                     "to_user_id": creditor_id,
                     "to_user_name": user_names.get(creditor_id, "Unknown"),
                     "amount": transfer_amount,
+                    "includes_unconfirmed": includes_unconfirmed,
                 })
 
             # Update balances

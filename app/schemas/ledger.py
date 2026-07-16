@@ -26,6 +26,7 @@ class LedgerMemberWithUser(LedgerMemberResponse):
 class LedgerBase(BaseModel):
     name: str
     currency: str = "CNY"
+    require_confirmation: bool = True
 
 
 class MemberCreate(BaseModel):
@@ -38,6 +39,13 @@ class MemberCreate(BaseModel):
 
 class LedgerCreate(LedgerBase):
     members: list[MemberCreate] = []
+
+
+class LedgerUpdate(BaseModel):
+    """Partial update (owner only). Omit fields that should stay unchanged."""
+    name: str | None = None
+    currency: str | None = None
+    require_confirmation: bool | None = None
 
 
 class LedgerResponse(LedgerBase):

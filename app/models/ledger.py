@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import CheckConstraint, Column, String, DateTime, ForeignKey, Index, UniqueConstraint, text
+from sqlalchemy import Boolean, CheckConstraint, Column, String, DateTime, ForeignKey, Index, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -14,6 +14,9 @@ class Ledger(Base):
     name = Column(String(255), nullable=False)
     owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     currency = Column(String(10), default="CNY")
+    # When True, expenses stay pending until required participants confirm.
+    # When False, expenses are auto-confirmed and count toward settlement immediately.
+    require_confirmation = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

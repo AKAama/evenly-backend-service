@@ -246,7 +246,7 @@ def change_password(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Change user password"""
+    """Change user password (app users and platform ops)."""
     # Verify old password
     identity = get_password_identity(db, current_user.id)
     if not identity or not identity.password_hash or not verify_password(
@@ -254,14 +254,29 @@ def change_password(
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Incorrect old password"
+            detail="当前密码不正确",
         )
+
+    if len(password_change.new_password) < 6:
+        raise HTTPException(status_code=400, detail="新密码至少 6 位")
 
     # Update password
     set_password(db, current_user, password_change.new_password)
     db.commit()
 
-    return {"message": "Password updated successfully"}
+    from app.services.audit import record_audit
+
+    record_audit(
+        db,
+        action="auth.password_change",
+        actor=current_user,
+        resource_type="user",
+        resource_id=current_user.id,
+        summary=f"修改密码 {current_user.username}",
+        source="console",
+    )
+
+    return {"message": "密码已更新"}
 
 
 @router.post("/me/password/setup/send")

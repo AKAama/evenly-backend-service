@@ -230,57 +230,20 @@ def admin_ledger_overview(
             expense_to_with_details(expense, status=effective_status.value)
         )
 
-    registered_members = [m for m in active_members if m.user_id is not None]
-    balances = {m.user_id: Decimal("0") for m in registered_members}
-    names = {
-        m.user_id: (
-            (m.user.display_name or m.user.email)
-            if m.user
-            else (m.nickname or "Unknown")
-        )
-        for m in registered_members
-    }
-    for expense in expenses:
-        if expense.status != ExpenseStatus.CONFIRMED:
-            continue
-        if expense.payer_id in balances:
-            balances[expense.payer_id] += expense_net_amount(expense)
-        for split, amount in expense_scaled_split_amounts(expense):
-            if split.user_id in balances:
-                balances[split.user_id] -= amount
+    from app.services.settlement import SettlementCalculator
 
-    creditors = sorted(
-        [(uid, amt) for uid, amt in balances.items() if amt > 0],
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    debtors = sorted(
-        [(uid, -amt) for uid, amt in balances.items() if amt < 0],
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    suggestions: list[SettlementInstruction] = []
-    i = j = 0
-    while i < len(creditors) and j < len(debtors):
-        cid, credit = creditors[i]
-        did, debt = debtors[j]
-        amount = min(credit, debt)
-        if amount > 0:
-            suggestions.append(
-                SettlementInstruction(
-                    from_user_id=did,
-                    from_user_name=names.get(did, "Unknown"),
-                    to_user_id=cid,
-                    to_user_name=names.get(cid, "Unknown"),
-                    amount=amount,
-                )
-            )
-        creditors[i] = (cid, credit - amount)
-        debtors[j] = (did, debt - amount)
-        if creditors[i][1] <= 0:
-            i += 1
-        if debtors[j][1] <= 0:
-            j += 1
+    calculator = SettlementCalculator(db, ledger_id)
+    suggestions = [
+        SettlementInstruction(
+            from_user_id=s["from_user_id"],
+            from_user_name=s["from_user_name"],
+            to_user_id=s["to_user_id"],
+            to_user_name=s["to_user_name"],
+            amount=s["amount"],
+            includes_unconfirmed=bool(s.get("includes_unconfirmed", False)),
+        )
+        for s in calculator.calculate_settlements()
+    ]
 
     ledger_response = LedgerWithMembers.model_validate(ledger)
     ledger_response.members = member_responses

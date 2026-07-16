@@ -46,6 +46,7 @@ def get_settlements(
             to_user_id=s["to_user_id"],
             to_user_name=s["to_user_name"],
             amount=s["amount"],
+            includes_unconfirmed=bool(s.get("includes_unconfirmed", False)),
         )
         for s in settlements
     ]

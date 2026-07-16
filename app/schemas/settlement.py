@@ -38,3 +38,5 @@ class SettlementInstruction(BaseModel):
     to_user_id: UUID
     to_user_name: str
     amount: Decimal
+    # True when this transfer involves parties still on pending (unconfirmed) bills.
+    includes_unconfirmed: bool = False

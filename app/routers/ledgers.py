@@ -23,6 +23,7 @@ from app.models import (
 )
 from app.schemas.ledger import (
     LedgerCreate,
+    LedgerUpdate,
     LedgerResponse,
     LedgerWithMembers,
     AddMemberRequest,
@@ -135,6 +136,7 @@ def create_ledger(
         name=ledger.name,
         owner_id=current_user.id,
         currency=ledger.currency,
+        require_confirmation=ledger.require_confirmation,
     )
     db.add(db_ledger)
     db.commit()
@@ -227,6 +229,7 @@ def create_ledger(
         name=db_ledger.name,
         owner_id=db_ledger.owner_id,
         currency=db_ledger.currency,
+        require_confirmation=bool(db_ledger.require_confirmation),
         created_at=db_ledger.created_at,
         updated_at=db_ledger.updated_at,
         members=all_members
@@ -652,54 +655,21 @@ def get_ledger_overview(
 
     history = []
 
-    registered_members = [member for member in active_members if member.user_id is not None]
-    balances = {member.user_id: Decimal("0") for member in registered_members}
-    names = {
-        member.user_id: (
-            member.user.display_name or member.user.email
-            if member.user else member.nickname or "Unknown"
-        )
-        for member in registered_members
-    }
-    from app.services.settlement import expense_net_amount, expense_scaled_split_amounts
+    # Same projected flow as /settlements: confirmed + pending, with unconfirmed flags.
+    from app.services.settlement import SettlementCalculator
 
-    for expense in expenses:
-        if expense.status != ExpenseStatus.CONFIRMED:
-            continue
-        if expense.payer_id in balances:
-            balances[expense.payer_id] += expense_net_amount(expense)
-        for split, amount in expense_scaled_split_amounts(expense):
-            if split.user_id in balances:
-                balances[split.user_id] -= amount
-    creditors = sorted(
-        [(user_id, amount) for user_id, amount in balances.items() if amount > 0],
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    debtors = sorted(
-        [(user_id, -amount) for user_id, amount in balances.items() if amount < 0],
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    suggestions = []
-    creditor_index = debtor_index = 0
-    while creditor_index < len(creditors) and debtor_index < len(debtors):
-        creditor_id, credit = creditors[creditor_index]
-        debtor_id, debt = debtors[debtor_index]
-        amount = min(credit, debt)
-        suggestions.append(SettlementInstruction(
-            from_user_id=debtor_id,
-            from_user_name=names.get(debtor_id, "Unknown"),
-            to_user_id=creditor_id,
-            to_user_name=names.get(creditor_id, "Unknown"),
-            amount=amount,
-        ))
-        creditors[creditor_index] = (creditor_id, credit - amount)
-        debtors[debtor_index] = (debtor_id, debt - amount)
-        if creditors[creditor_index][1] <= 0:
-            creditor_index += 1
-        if debtors[debtor_index][1] <= 0:
-            debtor_index += 1
+    calculator = SettlementCalculator(db, ledger_id)
+    suggestions = [
+        SettlementInstruction(
+            from_user_id=s["from_user_id"],
+            from_user_name=s["from_user_name"],
+            to_user_id=s["to_user_id"],
+            to_user_name=s["to_user_name"],
+            amount=s["amount"],
+            includes_unconfirmed=bool(s.get("includes_unconfirmed", False)),
+        )
+        for s in calculator.calculate_settlements()
+    ]
 
     ledger_response = LedgerWithMembers.model_validate(ledger)
     ledger_response.members = member_responses
@@ -711,6 +681,106 @@ def get_ledger_overview(
         settlement_suggestions=suggestions,
         settlement_history=history,
     )
+
+
+@router.patch("/{ledger_id}", response_model=LedgerWithMembers)
+def update_ledger(
+    ledger_id: UUID,
+    payload: LedgerUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
+):
+    """Update ledger settings (owner only). Turning off confirmation auto-confirms pending bills."""
+    from app.services.audit import record_audit
+
+    ledger = get_ledger_or_404(db, ledger_id)
+    if ledger.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only owner can update the ledger")
+
+    data = payload.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    if "name" in data and data["name"] is not None:
+        new_name = data["name"].strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="账本名称不能为空")
+        existing = (
+            db.query(Ledger)
+            .filter(
+                Ledger.name == new_name,
+                Ledger.owner_id == current_user.id,
+                Ledger.id != ledger_id,
+            )
+            .first()
+        )
+        if existing:
+            raise HTTPException(status_code=400, detail="账本名称已存在，请使用其他名称")
+        ledger.name = new_name
+
+    if "currency" in data and data["currency"] is not None:
+        ledger.currency = data["currency"]
+
+    turned_off_confirmation = False
+    if "require_confirmation" in data and data["require_confirmation"] is not None:
+        new_flag = bool(data["require_confirmation"])
+        if ledger.require_confirmation and not new_flag:
+            turned_off_confirmation = True
+        ledger.require_confirmation = new_flag
+
+    if turned_off_confirmation:
+        # Pending bills should immediately enter settlement when confirmation is disabled.
+        (
+            db.query(Expense)
+            .filter(
+                Expense.ledger_id == ledger_id,
+                Expense.status == ExpenseStatus.PENDING,
+            )
+            .update({"status": ExpenseStatus.CONFIRMED}, synchronize_session=False)
+        )
+
+    ledger.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(ledger)
+
+    members = (
+        db.query(LedgerMember)
+        .options(joinedload(LedgerMember.user))
+        .filter(LedgerMember.ledger_id == ledger_id)
+        .all()
+    )
+    member_responses = [
+        LedgerMemberWithUser(
+            id=member.id,
+            user_id=member.user_id,
+            nickname=member.nickname,
+            joined_at=member.joined_at,
+            user=UserResponse.model_validate(member.user) if member.user else None,
+            is_temporary=member.is_temporary,
+            temporary_name=member.temporary_name,
+            status=member.status,
+        )
+        for member in members
+    ]
+    active_count = sum(1 for m in members if m.status == "active")
+
+    record_audit(
+        db,
+        action="ledger.update",
+        actor=current_user,
+        resource_type="ledger",
+        resource_id=ledger.id,
+        ledger_id=ledger.id,
+        summary=f"更新账本「{ledger.name}」设置",
+        metadata=data,
+        source=_x_client_source(x_client),
+    )
+
+    response = LedgerWithMembers.model_validate(ledger)
+    response.members = member_responses
+    response.member_count = active_count
+    return response
 
 
 @router.delete("/{ledger_id}", status_code=status.HTTP_204_NO_CONTENT)

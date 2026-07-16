@@ -57,10 +57,11 @@ from app.routers.ledgers import (
     reject_invitation,
     remove_member,
     rotate_invite_link,
+    update_ledger,
 )
 from app.schemas.ledger import AddMemberRequest
 from app.routers import users as users_router
-from app.schemas.ledger import LedgerCreate, MemberCreate
+from app.schemas.ledger import LedgerCreate, LedgerUpdate, MemberCreate
 from app.routers.settlements import create_settlement, get_settlements
 from app.schemas.expense import (
     ConfirmExpenseRequest,
@@ -1554,6 +1555,82 @@ def test_payer_does_not_need_to_confirm_expense(db):
     assert expense.status == ExpenseStatus.CONFIRMED
 
 
+def test_ledger_without_confirmation_auto_confirms_and_settles(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+
+    update_ledger(
+        ledger.id,
+        LedgerUpdate(require_confirmation=False),
+        db=db,
+        current_user=owner,
+    )
+    db.refresh(ledger)
+    assert ledger.require_confirmation is False
+
+    expense = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Lunch",
+            total_amount=Decimal("100.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("50.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("50.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+    assert expense.status == ExpenseStatus.CONFIRMED
+
+    settlements = get_settlements(ledger.id, db=db, current_user=owner)
+    assert len(settlements) == 1
+    assert settlements[0].from_user_id == friend.id
+    assert settlements[0].to_user_id == owner.id
+    assert settlements[0].amount == Decimal("50.00")
+
+
+def test_turning_off_confirmation_confirms_pending_expenses(db):
+    owner = make_user(db, "owner@example.com", "Owner")
+    friend = make_user(db, "friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+
+    expense = create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Dinner",
+            total_amount=Decimal("80.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(user_id=owner.id, amount=Decimal("40.00")),
+                ExpenseSplitCreate(user_id=friend.id, amount=Decimal("40.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+    assert expense.status == ExpenseStatus.PENDING
+
+    update_ledger(
+        ledger.id,
+        LedgerUpdate(require_confirmation=False),
+        db=db,
+        current_user=owner,
+    )
+    db.refresh(expense)
+    assert expense.status == ExpenseStatus.CONFIRMED
+
+    settlements = get_settlements(ledger.id, db=db, current_user=owner)
+    assert len(settlements) == 1
+    assert settlements[0].amount == Decimal("40.00")
+
+
 def test_settlement_rejects_same_user_and_non_positive_amount(db):
     owner = make_user(db, "owner@example.com", "Owner")
     ledger = make_ledger(db, owner)
@@ -1577,7 +1654,8 @@ def test_settlement_rejects_same_user_and_non_positive_amount(db):
     assert_http_error(exc_info, 400)
 
 
-def test_transfer_flow_appears_only_after_every_participant_confirms(db):
+def test_transfer_flow_projects_pending_and_marks_unconfirmed(db):
+    """Pending bills already shape transfer flow; marked until fully confirmed."""
     owner = make_user(db, "owner@example.com", "Owner")
     friend = make_user(db, "friend@example.com", "Friend")
     ledger = make_ledger(db, owner)
@@ -1595,7 +1673,12 @@ def test_transfer_flow_appears_only_after_every_participant_confirms(db):
     )
     expense = create_expense(ledger.id, payload, db=db, current_user=owner)
 
-    assert get_settlements(ledger.id, db=db, current_user=owner) == []
+    pending_suggestions = get_settlements(ledger.id, db=db, current_user=owner)
+    assert len(pending_suggestions) == 1
+    assert pending_suggestions[0].from_user_id == friend.id
+    assert pending_suggestions[0].to_user_id == owner.id
+    assert pending_suggestions[0].amount == Decimal("5.00")
+    assert pending_suggestions[0].includes_unconfirmed is True
 
     confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=friend)
 
@@ -1604,6 +1687,7 @@ def test_transfer_flow_appears_only_after_every_participant_confirms(db):
     assert suggestions[0].from_user_id == friend.id
     assert suggestions[0].to_user_id == owner.id
     assert suggestions[0].amount == Decimal("5.00")
+    assert suggestions[0].includes_unconfirmed is False
 
 
 def test_recorded_settlement_does_not_change_generated_transfer_flow(db):
@@ -2052,7 +2136,14 @@ def test_two_user_collaboration_flow_through_api(db, client):
 
         pending_overview = friend_client.get(f"/ledgers/{ledger_id}/overview")
         assert pending_overview.status_code == 200
-        assert pending_overview.json()["settlement_suggestions"] == []
+        assert pending_overview.json()["settlement_suggestions"] == [{
+            "from_user_id": str(friend.id),
+            "from_user_name": "Stella",
+            "to_user_id": str(owner.id),
+            "to_user_name": "cwq",
+            "amount": "50.00",
+            "includes_unconfirmed": True,
+        }]
 
         confirm_response = friend_client.post(
             f"/expenses/{expense_id}/confirm",
@@ -2072,6 +2163,7 @@ def test_two_user_collaboration_flow_through_api(db, client):
                 "to_user_id": str(owner.id),
                 "to_user_name": "cwq",
                 "amount": "50.00",
+                "includes_unconfirmed": False,
             }]
 
         delete_response = owner_client.delete(f"/expenses/{expense_id}")

@@ -568,6 +568,13 @@ def _required_participants_for(resolved_splits, created_by, payer_id) -> set:
     )
 
 
+def _ledger_requires_confirmation(db: Session, ledger_id: UUID) -> bool:
+    row = db.query(Ledger.require_confirmation).filter(Ledger.id == ledger_id).first()
+    if row is None:
+        return True
+    return bool(row[0])
+
+
 def _persist_expense_row(
     *,
     db: Session,
@@ -577,6 +584,7 @@ def _persist_expense_row(
     resolved_splits,
     commit: bool = True,
 ) -> Expense:
+    needs_confirmation = _ledger_requires_confirmation(db, ledger_id)
     db_expense = Expense(
         ledger_id=ledger_id,
         payer_id=payload.payer_id,
@@ -588,7 +596,7 @@ def _persist_expense_row(
         icon_type=payload.icon_type,
         icon_value=payload.icon_value,
         expense_date=payload.expense_date,
-        status=ExpenseStatus.PENDING,
+        status=ExpenseStatus.PENDING if needs_confirmation else ExpenseStatus.CONFIRMED,
     )
     db.add(db_expense)
     db.flush()
@@ -602,6 +610,12 @@ def _persist_expense_row(
                 amount=split.amount,
             )
         )
+
+    if not needs_confirmation:
+        if commit:
+            db.commit()
+            db.refresh(db_expense)
+        return db_expense
 
     registered_participant_ids = {
         member.user_id for _, member in resolved_splits if member.user_id is not None
@@ -640,7 +654,7 @@ def update_expense(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Edit a pending expense (creator only). Resets other members' confirmations."""
+    """Edit an expense (creator only). Pending when confirmation is on; resets confirmations."""
     expense = db.query(Expense).filter(Expense.id == expense_id).first()
     if not expense:
         raise HTTPException(status_code=404, detail="Expense not found")
@@ -648,11 +662,15 @@ def update_expense(
     require_ledger_member(db, expense.ledger_id, current_user)
     if expense.created_by != current_user.id:
         raise HTTPException(status_code=403, detail="Only the expense creator can edit this expense")
-    if expense.status != ExpenseStatus.PENDING:
+    needs_confirmation = _ledger_requires_confirmation(db, expense.ledger_id)
+    # With confirmation off, confirmed bills remain editable by the creator.
+    if needs_confirmation and expense.status != ExpenseStatus.PENDING:
         raise HTTPException(
             status_code=400,
             detail=f"Only pending expenses can be edited (current: {expense.status.value})",
         )
+    if expense.status == ExpenseStatus.REJECTED:
+        raise HTTPException(status_code=400, detail="Rejected expenses cannot be edited")
 
     resolved_splits, _payer_member = _resolve_expense_splits(
         ledger_id=expense.ledger_id,
@@ -670,7 +688,9 @@ def update_expense(
     expense.icon_value = payload.icon_value
     expense.expense_date = payload.expense_date
     expense.payer_id = payload.payer_id
-    expense.status = ExpenseStatus.PENDING
+
+    needs_confirmation = _ledger_requires_confirmation(db, expense.ledger_id)
+    expense.status = ExpenseStatus.PENDING if needs_confirmation else ExpenseStatus.CONFIRMED
 
     # Replace splits + confirmations so previous acknowledgements cannot stick.
     db.query(ExpenseSplit).filter(ExpenseSplit.expense_id == expense.id).delete(
@@ -691,29 +711,31 @@ def update_expense(
             )
         )
 
-    registered_participant_ids = {
-        member.user_id for _, member in resolved_splits if member.user_id is not None
-    }
-    auto_confirm_ids = confirmation_exempt_user_ids(
-        created_by=expense.created_by,
-        payer_id=expense.payer_id,
-    ) & registered_participant_ids
-    for user_id in auto_confirm_ids:
-        db.add(
-            ExpenseConfirmation(
-                expense_id=expense.id,
-                user_id=user_id,
-                status="confirmed",
+    required_participants: set = set()
+    if needs_confirmation:
+        registered_participant_ids = {
+            member.user_id for _, member in resolved_splits if member.user_id is not None
+        }
+        auto_confirm_ids = confirmation_exempt_user_ids(
+            created_by=expense.created_by,
+            payer_id=expense.payer_id,
+        ) & registered_participant_ids
+        for user_id in auto_confirm_ids:
+            db.add(
+                ExpenseConfirmation(
+                    expense_id=expense.id,
+                    user_id=user_id,
+                    status="confirmed",
+                )
             )
-        )
 
-    required_participants = required_confirmation_user_ids(
-        registered_participant_ids,
-        created_by=expense.created_by,
-        payer_id=expense.payer_id,
-    )
-    if not required_participants:
-        expense.status = ExpenseStatus.CONFIRMED
+        required_participants = required_confirmation_user_ids(
+            registered_participant_ids,
+            created_by=expense.created_by,
+            payer_id=expense.payer_id,
+        )
+        if not required_participants:
+            expense.status = ExpenseStatus.CONFIRMED
 
     db.commit()
     db.refresh(expense)
