@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-07-17 — Sign in with Apple without post-login profile gate
+
+- Apple login no longer fails when the identity token omits email; uses a stable placeholder and never asks the client to re-collect email/name.
+- Applies `full_name` from the first SIWA credential to `display_name` when provided.
+
 ## 2026-07-16 — Ledger confirmation toggle & projected settlements
 
 - Added per-ledger `require_confirmation` (migration `20260716_0021`); default on for existing ledgers.

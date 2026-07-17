@@ -285,14 +285,24 @@ def login_with_apple(
 
     if identity is not None:
         user = identity.user
+        # First Apple sign-in is the only time full_name is usually provided; backfill if empty.
+        if request.full_name and request.full_name.strip():
+            if not (user.display_name or "").strip() or user.display_name == (user.email or "").split("@", 1)[0]:
+                user.display_name = request.full_name.strip()
+                db.commit()
+                db.refresh(user)
     else:
+        # Prefer email from the identity token (includes Hide My Email relay).
+        # Never prompt the client to re-enter name/email (App Store SIWA rules).
         email = str(claims.get("email") or "").strip().lower()
-        email_verified = claims.get("email_verified") in (True, "true", "True")
-        if not email or not email_verified:
-            raise HTTPException(status_code=400, detail="Apple 未提供已验证邮箱，请重新授权")
+        is_placeholder_email = False
+        if not email:
+            # Rare: token without email claim. Stable placeholder — do not ask the user.
+            email = f"apple.{subject[:32].lower()}@privaterelay.evenly.local"
+            is_placeholder_email = True
 
-        # A verified Apple email can safely attach to the matching local account.
-        user = get_user_by_email(db, email)
+        # Link to an existing account only when Apple gave a real email claim.
+        user = None if is_placeholder_email else get_user_by_email(db, email)
         if user is None:
             username_base = f"apple_{hashlib.sha256(subject.encode()).hexdigest()[:12]}"
             username = username_base[:30]
@@ -300,12 +310,20 @@ def login_with_apple(
             while get_user_by_username(db, username):
                 suffix += 1
                 username = f"{username_base[:25]}_{suffix}"
+            display = (request.full_name or "").strip()
+            if not display:
+                local = email.split("@", 1)[0]
+                display = (
+                    "Evenly 用户"
+                    if is_placeholder_email or local.startswith("apple_")
+                    else local
+                )
             user = User(
                 email=email,
                 username=username,
                 username_is_generated=True,
                 password_hash=get_password_hash(secrets.token_urlsafe(32)),
-                display_name=request.full_name.strip() if request.full_name else email.split("@", 1)[0],
+                display_name=display,
             )
             db.add(user)
             db.flush()
@@ -314,7 +332,7 @@ def login_with_apple(
             user_id=user.id,
             provider="apple",
             provider_subject=subject,
-            email=email,
+            email=None if is_placeholder_email else email,
         ))
         db.commit()
         db.refresh(user)
