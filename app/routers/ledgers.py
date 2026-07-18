@@ -3,7 +3,7 @@ import secrets
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, UploadFile, status
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import joinedload, Session
 from typing import List
@@ -39,6 +39,7 @@ from app.schemas.ledger import (
 from app.schemas.expense import expense_to_with_details
 from app.schemas.settlement import SettlementInstruction
 from app.schemas.user import UserResponse
+from app.services.audit import user_to_response
 from app.utils.deps import get_current_user, get_ledger_or_404, require_ledger_member
 from app.services.push import PushEvent, build_payload, send_push_safely
 from app.services import invitation_cache
@@ -194,7 +195,7 @@ def create_ledger(
             user_id=member.user_id,
             nickname=member.nickname,
             joined_at=member.joined_at,
-            user=UserResponse.model_validate(member_user) if member_user else None,
+            user=user_to_response(member_user) if member_user else None,
             is_temporary=member.is_temporary,
                 temporary_name=member.temporary_name,
             status=member.status,
@@ -212,7 +213,7 @@ def create_ledger(
         ))
 
     # Build response with all members including owner
-    owner_user_response = UserResponse.model_validate(current_user)
+    owner_user_response = user_to_response(current_user)
     owner_member_response = MemberResponse(
         id=owner_member.id,
         user_id=current_user.id,
@@ -557,7 +558,7 @@ def get_ledger(
             user_id=m.user_id,
             nickname=m.nickname,
             joined_at=m.joined_at,
-            user=UserResponse.model_validate(user) if user else None,
+            user=user_to_response(user) if user else None,
             is_temporary=m.is_temporary,
             temporary_name=m.temporary_name,
             status=m.status,
@@ -605,7 +606,7 @@ def get_ledger_overview(
             user_id=member.user_id,
             nickname=member.nickname,
             joined_at=member.joined_at,
-            user=UserResponse.model_validate(member.user) if member.user else None,
+            user=user_to_response(member.user) if member.user else None,
             is_temporary=member.is_temporary,
             temporary_name=member.temporary_name,
             status=member.status,
@@ -756,7 +757,7 @@ def update_ledger(
             user_id=member.user_id,
             nickname=member.nickname,
             joined_at=member.joined_at,
-            user=UserResponse.model_validate(member.user) if member.user else None,
+            user=user_to_response(member.user) if member.user else None,
             is_temporary=member.is_temporary,
             temporary_name=member.temporary_name,
             status=member.status,
@@ -780,6 +781,160 @@ def update_ledger(
     response = LedgerWithMembers.model_validate(ledger)
     response.members = member_responses
     response.member_count = active_count
+    return response
+
+
+@router.post("/{ledger_id}/cover", response_model=LedgerWithMembers)
+async def upload_ledger_cover(
+    ledger_id: UUID,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
+):
+    """Upload a custom bookshelf cover (owner only). Same COS pipeline as avatars."""
+    from app.config import settings
+    from app.services.audit import record_audit
+    from app.services.cos import get_cos_service
+
+    ledger = get_ledger_or_404(db, ledger_id)
+    if ledger.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only owner can set the ledger cover")
+
+    if not settings.cos:
+        raise HTTPException(status_code=503, detail="图片上传未配置")
+
+    allowed_types = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="仅支持 jpeg / png / gif / webp")
+
+    contents = await file.read()
+    if len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="图片不能超过 5MB")
+
+    try:
+        cos_service = get_cos_service()
+        if cos_service is None:
+            raise RuntimeError("COS service unavailable")
+        cover_url = cos_service.upload_file(
+            file_data=contents,
+            filename=file.filename or "cover.jpg",
+            folder="ledger-covers",
+        )
+    except Exception as exc:
+        logger.exception("Ledger cover upload failed ledger_id=%s: %s", ledger_id, exc)
+        raise HTTPException(status_code=502, detail="封面上传暂时不可用") from exc
+
+    old_url = ledger.cover_url
+    ledger.cover_url = cover_url
+    ledger.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(ledger)
+
+    if old_url and old_url != cover_url:
+        try:
+            cos_service.delete_file(old_url)
+        except Exception:
+            logger.warning("Failed to delete old ledger cover url=%s", old_url)
+
+    record_audit(
+        db,
+        action="ledger.cover_upload",
+        actor=current_user,
+        resource_type="ledger",
+        resource_id=ledger.id,
+        ledger_id=ledger.id,
+        summary=f"更新账本「{ledger.name}」封面",
+        source=_x_client_source(x_client),
+    )
+
+    members = (
+        db.query(LedgerMember)
+        .options(joinedload(LedgerMember.user))
+        .filter(LedgerMember.ledger_id == ledger_id)
+        .all()
+    )
+    member_responses = [
+        LedgerMemberWithUser(
+            id=member.id,
+            user_id=member.user_id,
+            nickname=member.nickname,
+            joined_at=member.joined_at,
+            user=user_to_response(member.user) if member.user else None,
+            is_temporary=member.is_temporary,
+            temporary_name=member.temporary_name,
+            status=member.status,
+        )
+        for member in members
+    ]
+    response = LedgerWithMembers.model_validate(ledger)
+    response.members = member_responses
+    response.member_count = sum(1 for m in members if m.status == "active")
+    return response
+
+
+@router.delete("/{ledger_id}/cover", response_model=LedgerWithMembers)
+def delete_ledger_cover(
+    ledger_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
+):
+    """Remove custom cover and fall back to generated book style (owner only)."""
+    from app.services.audit import record_audit
+    from app.services.cos import get_cos_service
+
+    ledger = get_ledger_or_404(db, ledger_id)
+    if ledger.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only owner can clear the ledger cover")
+
+    old_url = ledger.cover_url
+    ledger.cover_url = None
+    ledger.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(ledger)
+
+    if old_url:
+        try:
+            cos = get_cos_service()
+            if cos is not None:
+                cos.delete_file(old_url)
+        except Exception:
+            logger.warning("Failed to delete ledger cover from COS url=%s", old_url)
+
+    record_audit(
+        db,
+        action="ledger.cover_delete",
+        actor=current_user,
+        resource_type="ledger",
+        resource_id=ledger.id,
+        ledger_id=ledger.id,
+        summary=f"移除账本「{ledger.name}」封面",
+        source=_x_client_source(x_client),
+    )
+
+    members = (
+        db.query(LedgerMember)
+        .options(joinedload(LedgerMember.user))
+        .filter(LedgerMember.ledger_id == ledger_id)
+        .all()
+    )
+    member_responses = [
+        LedgerMemberWithUser(
+            id=member.id,
+            user_id=member.user_id,
+            nickname=member.nickname,
+            joined_at=member.joined_at,
+            user=user_to_response(member.user) if member.user else None,
+            is_temporary=member.is_temporary,
+            temporary_name=member.temporary_name,
+            status=member.status,
+        )
+        for member in members
+    ]
+    response = LedgerWithMembers.model_validate(ledger)
+    response.members = member_responses
+    response.member_count = sum(1 for m in members if m.status == "active")
     return response
 
 
@@ -931,7 +1086,7 @@ def add_member(
             user_id=existing.user_id,
             nickname=existing.nickname,
             joined_at=existing.joined_at,
-            user=UserResponse.model_validate(user),
+            user=user_to_response(user),
             is_temporary=False,
             temporary_name=None,
             status=existing.status,
@@ -975,7 +1130,7 @@ def add_member(
         user_id=member.user_id,
         nickname=member.nickname,
         joined_at=member.joined_at,
-        user=UserResponse.model_validate(user),
+        user=user_to_response(user),
         is_temporary=False,
         temporary_name=None,
         status="pending",
@@ -1005,7 +1160,7 @@ def get_members(
             user_id=m.user_id,
             nickname=m.nickname,
             joined_at=m.joined_at,
-            user=UserResponse.model_validate(user) if user else None,
+            user=user_to_response(user) if user else None,
             is_temporary=m.is_temporary,
             temporary_name=m.temporary_name,
             status=m.status,

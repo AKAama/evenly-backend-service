@@ -3,6 +3,7 @@ from app.models.ledger import Ledger, LedgerInviteLink, LedgerMember
 from app.models.expense import Expense, ExpenseSplit, ExpenseConfirmation, ExpenseStatus
 from app.models.settlement import Settlement
 from app.models.audit import AuditEvent
+from app.models.badge import Badge
 
 __all__ = [
     "User",
@@ -17,4 +18,5 @@ __all__ = [
     "ExpenseStatus",
     "Settlement",
     "AuditEvent",
+    "Badge",
 ]

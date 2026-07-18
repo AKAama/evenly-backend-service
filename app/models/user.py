@@ -17,6 +17,8 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     display_name = Column(String(100))
     avatar_url = Column(String)
+    # Optional nameplate key (founder/crew/mate/beta/vip); display-only, set by platform admin.
+    badge = Column(String(32), nullable=True)
     # app = normal Evenly user; platform = ops-only console account (no ledger membership).
     account_kind = Column(String(20), nullable=False, default="app", server_default="app")
     # Legacy flag kept for DB compatibility; console admin is decided by account_kind=platform.

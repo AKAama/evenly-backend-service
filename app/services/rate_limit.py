@@ -65,11 +65,25 @@ def enforce_rate_limit(bucket: str, *, limit: int, window_seconds: int, detail: 
 
 
 def client_ip(request: Request | None) -> str:
+    """Best-effort client IP (proxy-aware).
+
+    Order: X-Forwarded-For (first hop) → X-Real-IP → CF-Connecting-IP → ASGI client.
+    """
     if request is None:
         return "unknown"
-    forwarded = request.headers.get("x-forwarded-for")
+
+    forwarded = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
     if forwarded:
-        return forwarded.split(",")[0].strip() or "unknown"
+        # Left-most is the original client when proxies append.
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+
+    for header in ("x-real-ip", "X-Real-IP", "cf-connecting-ip", "CF-Connecting-IP"):
+        real = (request.headers.get(header) or "").strip()
+        if real:
+            return real
+
     if request.client and request.client.host:
         return request.client.host
     return "unknown"

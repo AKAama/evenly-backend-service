@@ -17,6 +17,8 @@ class Ledger(Base):
     # When True, expenses stay pending until required participants confirm.
     # When False, expenses are auto-confirmed and count toward settlement immediately.
     require_confirmation = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    # Optional custom cover image (COS URL), same storage style as user avatars.
+    cover_url = Column(String(512), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -23,6 +23,22 @@ app = FastAPI(
 
 
 @app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    """Bind client IP / X-Client into contextvars so record_audit always sees them."""
+    from app.services.request_context import bind_request_context, reset_request_context
+
+    tokens = None
+    try:
+        tokens = bind_request_context(request)
+    except Exception:
+        logger.exception("failed to bind request context")
+    try:
+        return await call_next(request)
+    finally:
+        reset_request_context(tokens)
+
+
+@app.middleware("http")
 async def request_timing_middleware(request: Request, call_next):
     started_at = perf_counter()
     status_code = 500

@@ -138,9 +138,11 @@ def expense_to_with_details(
     split_src = splits if splits is not None else expense.splits
     conf_src = confirmations if confirmations is not None else expense.confirmations
 
+    from app.services.audit import user_to_response
+
     return ExpenseWithDetails(
         **base,
-        payer=UserResponse.model_validate(payer_obj),
+        payer=user_to_response(payer_obj),
         splits=[
             s if isinstance(s, ExpenseSplitResponse) else ExpenseSplitResponse.model_validate(s)
             for s in split_src

@@ -27,6 +27,7 @@ class LedgerBase(BaseModel):
     name: str
     currency: str = "CNY"
     require_confirmation: bool = True
+    cover_url: str | None = None
 
 
 class MemberCreate(BaseModel):

@@ -48,15 +48,20 @@ def is_user_admin(user: User | None) -> bool:
     return is_platform_user(user)
 
 
-def user_to_response(user: User) -> "UserResponse":
+def user_to_response(user: User, db=None) -> "UserResponse":
     from app.schemas.user import UserResponse
+    from app.services.badges import badge_color, badge_label
 
     resp = UserResponse.model_validate(user)
     kind = getattr(user, "account_kind", None) or "app"
+    badge = getattr(user, "badge", None)
     return resp.model_copy(
         update={
             "account_kind": kind,
             "is_admin": is_user_admin(user),
+            "badge": badge,
+            "badge_label": badge_label(badge, db),
+            "badge_color": badge_color(badge, db),
         }
     )
 
@@ -97,20 +102,37 @@ def record_audit(
 
     from app.database import SessionLocal
 
+    from app.services.request_context import get_request_ip, get_request_source
+    from app.services.rate_limit import client_ip
+
     # Copy primitives off the request session objects (may expire after commit).
     uid = actor_user_id or (actor.id if actor else None)
     label = actor_label(actor) if actor else None
     rid = str(resource_id) if resource_id is not None else None
-    src = client_source(request) if request is not None else (source or "api")
+
+    # Source: explicit Request > explicit non-default source > request context > api
+    if request is not None:
+        src = client_source(request)
+    else:
+        src = source or "api"
+        if src == "api":
+            ctx_src = get_request_source()
+            if ctx_src:
+                src = ctx_src
     if src not in {"ios", "console", "web", "android", "api"}:
         src = "api"
-    if request is not None and ip is None:
-        try:
-            from app.services.rate_limit import client_ip
 
-            ip = client_ip(request)
+    # IP: explicit arg > Request > request context (middleware)
+    if ip is None:
+        try:
+            if request is not None:
+                ip = client_ip(request)
+            else:
+                ip = get_request_ip()
         except Exception:
             ip = None
+    if ip in ("", "unknown"):
+        ip = None
 
     if db is not None:
         session = sessionmaker(bind=db.get_bind())()
@@ -142,6 +164,17 @@ def record_audit(
 
 
 def day_bounds(day: date) -> tuple[datetime, datetime]:
-    start = datetime.combine(day, time.min)
-    end = datetime.combine(day, time.max)
-    return start, end
+    """Calendar day in Asia/Shanghai → naive UTC range.
+
+    Audit rows use ``datetime.utcnow()`` (naive UTC). Console "按天" is China local
+    date, so midnight–end must be converted or the filter (and display) skews by 8h.
+    """
+    from datetime import timezone as dt_timezone
+    from zoneinfo import ZoneInfo
+
+    cn = ZoneInfo("Asia/Shanghai")
+    start_cn = datetime.combine(day, time.min, tzinfo=cn)
+    end_cn = datetime.combine(day, time.max, tzinfo=cn)
+    start_utc = start_cn.astimezone(dt_timezone.utc).replace(tzinfo=None)
+    end_utc = end_cn.astimezone(dt_timezone.utc).replace(tzinfo=None)
+    return start_utc, end_utc

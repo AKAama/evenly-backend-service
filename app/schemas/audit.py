@@ -1,8 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 class AuditEventResponse(BaseModel):
@@ -20,6 +20,15 @@ class AuditEventResponse(BaseModel):
     summary: str | None = None
     metadata_json: dict[str, Any] | None = Field(default=None, validation_alias="metadata_json")
     ip: str | None = None
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, value: datetime) -> str:
+        """Emit explicit UTC (…Z). Naive values from DB are treated as UTC."""
+        if value is None:
+            return value
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class AuditEventListResponse(BaseModel):

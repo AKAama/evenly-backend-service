@@ -1,7 +1,18 @@
 # Changelog
 
-## 2026-07-17 — Sign in with Apple without post-login profile gate
+## 2026-07-18 — Admin password reset
 
+- Platform admin: `POST /admin/users/{id}/reset-password` sets a new password (min 6) without old password; audited as `user.password_reset_admin`.
+
+## 2026-07-18 — User nameplates (badges)
+
+- Added `users.badge` (migration `20260718_0023`) and admin-managed `badges` table (`20260718_0024`) seeded with 创始人/船员/搭子/内测官/特邀.
+- CRUD: `GET/POST /admin/badges`, `PATCH/DELETE /admin/badges/{id}`; assign `PATCH /admin/users/{id}/badge`.
+- `UserResponse` includes `badge`, `badge_label`, `badge_color`.
+
+## 2026-07-17 — Ledger covers & Sign in with Apple
+
+- Added `ledgers.cover_url` (migration `20260717_0022`) and owner-only `POST/DELETE /ledgers/{id}/cover` using the same COS upload path as avatars (`ledger-covers/` folder).
 - Apple login no longer fails when the identity token omits email; uses a stable placeholder and never asks the client to re-collect email/name.
 - Applies `full_name` from the first SIWA credential to `display_name` when provided.
 

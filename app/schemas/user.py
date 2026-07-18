@@ -11,6 +11,8 @@ class UserBase(BaseModel):
     display_name: str | None = None
     avatar_url: str | None = None
     username_is_generated: bool = False
+    # Preset nameplate key: founder | crew | mate | beta | vip | null
+    badge: str | None = None
 
 
 class UserCreate(UserBase):
@@ -37,6 +39,53 @@ class UserResponse(UserBase):
     account_kind: str = "app"
     # True only for platform ops accounts (account_kind=platform).
     is_admin: bool = False
+    # Resolved Chinese label for clients (null when no badge).
+    badge_label: str | None = None
+    # Ant Design color name or hex for chip styling.
+    badge_color: str | None = None
+
+
+class UserBadgeUpdate(BaseModel):
+    """Platform admin assigns or clears a nameplate on a user."""
+    badge: str | None = Field(
+        default=None,
+        description="Badge key from catalog, or null to clear",
+    )
+
+
+class AdminPasswordReset(BaseModel):
+    """Platform admin sets a new password for a user (no old password required)."""
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+class BadgeCreate(BaseModel):
+    label: str = Field(..., min_length=1, max_length=40)
+    description: str | None = Field(default=None, max_length=200)
+    color: str = Field(default="blue", max_length=32)
+    key: str | None = Field(default=None, max_length=32, description="Optional machine key")
+    sort_order: int | None = None
+
+
+class BadgeUpdate(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=40)
+    description: str | None = Field(default=None, max_length=200)
+    color: str | None = Field(default=None, max_length=32)
+    sort_order: int | None = None
+    is_active: bool | None = None
+
+
+class BadgeResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    key: str
+    label: str
+    description: str | None = None
+    color: str = "blue"
+    sort_order: int = 0
+    is_active: bool = True
+    user_count: int = 0
+    created_at: datetime | None = None
 
 
 class PlatformUserCreate(BaseModel):
