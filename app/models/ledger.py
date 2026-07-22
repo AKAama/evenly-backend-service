@@ -19,8 +19,16 @@ class Ledger(Base):
     require_confirmation = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     # Optional custom cover image (COS URL), same storage style as user avatars.
     cover_url = Column(String(512), nullable=True)
+    # active | archived — sole-owner deactivation archives instead of deleting.
+    status = Column(String(20), nullable=False, default="active", server_default="active")
+    archived_at = Column(DateTime, nullable=True)
+    archive_reason = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    @property
+    def is_archived(self) -> bool:
+        return (self.status or "active") == "archived"
 
     # Relationships
     owner = relationship("User", back_populates="ledgers")
@@ -96,7 +104,12 @@ class LedgerMember(Base):
     @property
     def display_name(self):
         if self.user_id is not None:
-            return (self.user.display_name or self.user.email) if self.user is not None else None
+            if self.user is None:
+                return None
+            # Prefer public_display_name so deactivated users show as 张三（已注销）
+            if hasattr(self.user, "public_display_name"):
+                return self.user.public_display_name
+            return self.user.display_name or self.user.email
         return self.temporary_name
 
     @display_name.setter

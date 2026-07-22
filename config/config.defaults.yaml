@@ -19,6 +19,9 @@ cors:
 verification_code_expire_seconds: 600
 verification_send_interval_seconds: 60
 
+# Username held after account deactivation before it can be re-registered (email is released immediately).
+username_release_days: 90
+
 jwt_secret_key: your-secret-key-change-in-production
 jwt_expire_minutes: 1440
 algorithm: HS256

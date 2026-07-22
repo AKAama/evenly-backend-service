@@ -39,10 +39,14 @@ class UserResponse(UserBase):
     account_kind: str = "app"
     # True only for platform ops accounts (account_kind=platform).
     is_admin: bool = False
+    # active | deactivated
+    status: str = "active"
     # Resolved Chinese label for clients (null when no badge).
     badge_label: str | None = None
     # Ant Design color name or hex for chip styling.
     badge_color: str | None = None
+    # Client-facing name; includes （已注销） when deactivated.
+    public_display_name: str | None = None
 
 
 class UserBadgeUpdate(BaseModel):
@@ -149,3 +153,51 @@ class PasswordReset(BaseModel):
 class PushDeviceRegistration(BaseModel):
     environment: Literal["sandbox", "production"]
     bundle_id: str = Field(min_length=1, max_length=255)
+
+
+class DeactivationOwnerTransfer(BaseModel):
+    ledger_id: UUID
+    new_owner_id: UUID | None = None
+
+
+class DeactivateAccountRequest(BaseModel):
+    owner_transfers: list[DeactivationOwnerTransfer] = Field(default_factory=list)
+    confirm: bool = True
+
+
+class MemberBriefResponse(BaseModel):
+    user_id: UUID
+    display_name: str
+    username: str
+
+
+class TransferPreviewItemResponse(BaseModel):
+    ledger_id: UUID
+    ledger_name: str
+    member_count_registered_active: int
+    default_successor: MemberBriefResponse | None = None
+    candidates: list[MemberBriefResponse] = Field(default_factory=list)
+
+
+class ArchivePreviewItemResponse(BaseModel):
+    ledger_id: UUID
+    ledger_name: str
+    action: str = "archive"
+    reason: str = "sole_owner_deactivated"
+
+
+class DeactivationPreviewResponse(BaseModel):
+    owned_ledgers_requiring_transfer: list[TransferPreviewItemResponse]
+    owned_ledgers_to_archive: list[ArchivePreviewItemResponse]
+    membership_ledger_count: int
+
+
+class TransferResultResponse(BaseModel):
+    ledger_id: UUID
+    ledger_name: str
+    action: str
+    new_owner: MemberBriefResponse | None = None
+
+
+class DeactivateAccountResponse(BaseModel):
+    transfers: list[TransferResultResponse]

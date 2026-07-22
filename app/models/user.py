@@ -23,12 +23,33 @@ class User(Base):
     account_kind = Column(String(20), nullable=False, default="app", server_default="app")
     # Legacy flag kept for DB compatibility; console admin is decided by account_kind=platform.
     is_admin = Column(Boolean, nullable=False, default=False, server_default="false")
+    # active | deactivated — soft deactivation keeps ledger history.
+    status = Column(String(20), nullable=False, default="active", server_default="active")
+    deactivated_at = Column(DateTime, nullable=True)
+    # Frozen at deactivation for "张三（已注销）" display.
+    display_name_frozen = Column(String(100), nullable=True)
+    # Username may be re-registered after this time (email released immediately).
+    username_held_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     @property
     def is_platform(self) -> bool:
         return (self.account_kind or "app") == "platform"
+
+    @property
+    def is_deactivated(self) -> bool:
+        return (self.status or "active") == "deactivated"
+
+    @property
+    def public_display_name(self) -> str:
+        """Client-facing label; appends （已注销） when deactivated."""
+        if self.is_deactivated:
+            base = (self.display_name_frozen or self.display_name or self.username or "用户").strip()
+            if base.endswith("（已注销）"):
+                return base
+            return f"{base}（已注销）"
+        return (self.display_name or self.username or self.email or "用户").strip()
 
     # Relationships
     ledgers = relationship("Ledger", back_populates="owner", cascade="all, delete-orphan")

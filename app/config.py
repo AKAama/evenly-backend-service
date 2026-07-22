@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     redis_url: Optional[str] = Field(default=None, validation_alias="REDIS_URL")
     verification_code_expire_seconds: int
     verification_send_interval_seconds: int
+    # Days to hold username after soft deactivation (email released immediately).
+    username_release_days: int = 90
 
     # Opt-in, server-side token for local test-only endpoints.
     test_admin_token: Optional[str] = Field(default=None, validation_alias="TEST_ADMIN_TOKEN")

@@ -20,10 +20,17 @@ from app.models import (
 )
 from app.schemas.user import (
     AuthMethodsResponse,
+    ArchivePreviewItemResponse,
+    DeactivateAccountRequest,
+    DeactivateAccountResponse,
+    DeactivationPreviewResponse,
     EmailChange,
     EmailChangeCodeRequest,
+    MemberBriefResponse,
     PasswordChange,
     PasswordSetup,
+    TransferPreviewItemResponse,
+    TransferResultResponse,
     UsernameUpdate,
     UserResponse,
     UserUpdate,
@@ -39,6 +46,7 @@ from app.services.auth import (
     get_user_by_username,
     verify_password,
 )
+from app.services import deactivation as deactivation_service
 from app.services.verification import send_verification_code, verify_code
 from app.services.rate_limit import enforce_rate_limit
 from app.config import settings
@@ -117,9 +125,8 @@ def update_username(
     username = request.username.strip()
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{2,29}", username):
         raise HTTPException(status_code=400, detail="用户名须为3-30位，以英文字母开头，仅包含英文、数字和下划线")
-    existing = get_user_by_username(db, username)
-    if existing and existing.id != current_user.id:
-        raise HTTPException(status_code=400, detail="用户名已被使用")
+    if username.lower() != (current_user.username or "").lower():
+        deactivation_service.ensure_username_available(db, username)
     current_user.username = username
     current_user.username_is_generated = False
     db.commit()
@@ -209,15 +216,18 @@ def search_users(
         window_seconds=60,
         detail="搜索过于频繁，请稍后重试",
     )
-    # Search by email, username, or display_name (case insensitive)
+    # Search by email, username, or display_name (case insensitive); hide deactivated.
     query = db.query(User).filter(
-        (User.email.ilike(f"%{q}%")) |
-        (User.username.ilike(f"%{q}%")) |
-        (User.display_name.ilike(f"%{q}%"))
+        ((User.status == "active") | (User.status.is_(None))),
+        (User.email.ilike(f"%{q}%"))
+        | (User.username.ilike(f"%{q}%"))
+        | (User.display_name.ilike(f"%{q}%")),
     ).limit(limit).all()
 
     # Exclude current user from results
-    return [u for u in query if u.id != current_user.id]
+    from app.services.audit import user_to_response
+
+    return [user_to_response(u) for u in query if u.id != current_user.id]
 
 
 @router.put("/me", response_model=UserResponse)
@@ -237,7 +247,9 @@ def update_user_info(
 
     db.commit()
     db.refresh(current_user)
-    return current_user
+    from app.services.audit import user_to_response
+
+    return user_to_response(current_user)
 
 
 @router.put("/me/password")
@@ -356,62 +368,103 @@ def change_email(
     return current_user
 
 
+@router.get("/me/deactivation-preview", response_model=DeactivationPreviewResponse)
+def deactivation_preview(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Preview owner transfers and archives before account deactivation."""
+    preview = deactivation_service.build_preview(db, current_user)
+
+    def _brief(b) -> MemberBriefResponse | None:
+        if b is None:
+            return None
+        return MemberBriefResponse(
+            user_id=b.user_id,
+            display_name=b.display_name,
+            username=b.username,
+        )
+
+    return DeactivationPreviewResponse(
+        owned_ledgers_requiring_transfer=[
+            TransferPreviewItemResponse(
+                ledger_id=item.ledger_id,
+                ledger_name=item.ledger_name,
+                member_count_registered_active=item.member_count_registered_active,
+                default_successor=_brief(item.default_successor),
+                candidates=[
+                    MemberBriefResponse(
+                        user_id=c.user_id,
+                        display_name=c.display_name,
+                        username=c.username,
+                    )
+                    for c in item.candidates
+                ],
+            )
+            for item in preview.owned_ledgers_requiring_transfer
+        ],
+        owned_ledgers_to_archive=[
+            ArchivePreviewItemResponse(
+                ledger_id=item.ledger_id,
+                ledger_name=item.ledger_name,
+                action=item.action,
+                reason=item.reason,
+            )
+            for item in preview.owned_ledgers_to_archive
+        ],
+        membership_ledger_count=preview.membership_ledger_count,
+    )
+
+
+@router.post("/me/deactivate", response_model=DeactivateAccountResponse)
+def deactivate_account(
+    body: DeactivateAccountRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Soft-deactivate account: transfer/archive owned ledgers, keep shared history."""
+    payload = body or DeactivateAccountRequest(confirm=True)
+    if not payload.confirm:
+        raise HTTPException(status_code=400, detail="请确认注销")
+    results = deactivation_service.deactivate_user(
+        db,
+        current_user,
+        owner_transfers=[t.model_dump() for t in payload.owner_transfers],
+        actor=current_user,
+        admin=False,
+    )
+    return DeactivateAccountResponse(
+        transfers=[
+            TransferResultResponse(
+                ledger_id=r.ledger_id,
+                ledger_name=r.ledger_name,
+                action=r.action,
+                new_owner=(
+                    MemberBriefResponse(
+                        user_id=r.new_owner.user_id,
+                        display_name=r.new_owner.display_name,
+                        username=r.new_owner.username,
+                    )
+                    if r.new_owner
+                    else None
+                ),
+            )
+            for r in results
+        ]
+    )
+
+
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
 def delete_account(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """Permanently delete the current account and its associated data."""
-    user_id = current_user.id
-    avatar_url = current_user.avatar_url
-
-    # Delete ledgers owned by the user in full.
-    for ledger in db.query(Ledger).filter(Ledger.owner_id == user_id).all():
-        db.delete(ledger)
-    db.flush()
-
-    # Remove user-generated records from shared ledgers. These records retain
-    # direct references to the account and must not survive account deletion.
-    split_expense_ids = {
-        expense_id
-        for (expense_id,) in db.query(ExpenseSplit.expense_id).filter(
-            ExpenseSplit.user_id == user_id
-        ).all()
-    }
-    related_expenses = db.query(Expense).filter(
-        (Expense.payer_id == user_id)
-        | (Expense.created_by == user_id)
-        | (Expense.id.in_(split_expense_ids) if split_expense_ids else False)
-    ).all()
-    for expense in related_expenses:
-        db.delete(expense)
-    db.flush()
-
-    db.query(Settlement).filter(
-        (Settlement.from_user_id == user_id) | (Settlement.to_user_id == user_id)
-    ).delete(synchronize_session=False)
-    db.query(ExpenseConfirmation).filter(
-        ExpenseConfirmation.user_id == user_id
-    ).delete(synchronize_session=False)
-    db.query(ExpenseSplit).filter(
-        ExpenseSplit.user_id == user_id
-    ).delete(synchronize_session=False)
-    db.query(LedgerMember).filter(
-        LedgerMember.user_id == user_id
-    ).delete(synchronize_session=False)
-
-    db.delete(current_user)
-    db.commit()
-
-    if avatar_url and settings.cos:
-        try:
-            cos_service = get_cos_service()
-            if cos_service is not None:
-                cos_service.delete_file(avatar_url)
-        except Exception:
-            # Do not restore a deleted account because external object cleanup
-            # failed. The orphan can be cleaned up from logs later.
-            logger.exception("Avatar cleanup failed for deleted user_id=%s", user_id)
-
-    logger.info("Account permanently deleted user_id=%s", user_id)
+    """Deprecated hard-delete path: performs the same soft deactivation as POST /me/deactivate."""
+    deactivation_service.deactivate_user(
+        db,
+        current_user,
+        owner_transfers=[],
+        actor=current_user,
+        admin=False,
+    )
     return None

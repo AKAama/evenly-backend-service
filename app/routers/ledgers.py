@@ -282,7 +282,11 @@ def get_ledgers(
             member_count.label("member_count"),
             expense_count.label("expense_count"),
         )
-        .filter(Ledger.id.in_(member_ledger_ids))
+        .filter(
+            Ledger.id.in_(member_ledger_ids),
+            # Archived (orphan) ledgers are not shown in the app; platform manages them.
+            (Ledger.status == "active") | (Ledger.status.is_(None)),
+        )
         .all()
     )
 

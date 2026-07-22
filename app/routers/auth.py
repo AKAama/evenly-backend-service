@@ -129,8 +129,9 @@ async def register(
     username = username.strip()
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{2,29}", username):
         raise HTTPException(status_code=400, detail="用户名须为3-30位，以英文字母开头，仅包含英文、数字和下划线")
-    if get_user_by_username(db, username):
-        raise HTTPException(status_code=400, detail="用户名已被使用")
+    from app.services.deactivation import ensure_username_available
+
+    ensure_username_available(db, username)
 
     # Handle avatar upload
     avatar_url = None
@@ -285,6 +286,9 @@ def login_with_apple(
 
     if identity is not None:
         user = identity.user
+        if user is None or (getattr(user, "status", None) or "active") == "deactivated":
+            # Soft-deactivated: identities should be gone; treat as invalid credentials.
+            raise HTTPException(status_code=401, detail="Apple 登录凭证无效")
         # First Apple sign-in is the only time full_name is usually provided; backfill if empty.
         if request.full_name and request.full_name.strip():
             if not (user.display_name or "").strip() or user.display_name == (user.email or "").split("@", 1)[0]:

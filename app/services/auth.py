@@ -47,6 +47,7 @@ def decode_token(token: str) -> TokenData | None:
 
 
 def get_user_by_email(db: Session, email: str) -> User | None:
+    # Deactivated accounts scrub email to deleted+{id}@invalid.local, so originals are free.
     return db.query(User).filter(func.lower(User.email) == email.strip().lower()).first()
 
 
@@ -135,4 +136,7 @@ def authenticate_user(db: Session, user_login: UserLogin) -> User | None:
         return None
     if not verify_password(user_login.password, identity.password_hash):
         return None
-    return identity.user
+    user = identity.user
+    if user is not None and (getattr(user, "status", None) or "active") == "deactivated":
+        return None
+    return user

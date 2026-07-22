@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -25,6 +26,7 @@ from app.schemas.user import (
     BadgeCreate,
     BadgeResponse,
     BadgeUpdate,
+    DeactivateAccountRequest,
     UserBadgeUpdate,
     UserResponse,
 )
@@ -47,6 +49,7 @@ class AdminUserItem(UserResponse):
     membership_count: int = 0
     expense_created_count: int = 0
     owned_ledger_count: int = 0
+    deactivated_at: datetime | None = None
 
 
 class AdminUserListResponse(BaseModel):
@@ -58,6 +61,8 @@ class AdminLedgerItem(LedgerResponse):
     owner_email: str | None = None
     owner_label: str | None = None
     total_spend: float = 0
+    # Archived with no non-deactivated registered members (label, not a separate status).
+    is_orphan: bool = False
 
 
 class AdminLedgerListResponse(BaseModel):
@@ -124,6 +129,7 @@ def admin_list_users(
                 membership_count=int(membership_count),
                 expense_created_count=int(expense_created_count),
                 owned_ledger_count=int(owned_ledger_count),
+                deactivated_at=getattr(u, "deactivated_at", None),
             )
         )
     return AdminUserListResponse(total=total, items=items)
@@ -351,6 +357,57 @@ def admin_set_user_badge(
     return user_to_response(user, db)
 
 
+@router.post("/users/{user_id}/deactivate")
+def admin_deactivate_user(
+    user_id: UUID,
+    body: DeactivateAccountRequest | None = None,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Soft-deactivate any app user (same rules as self-service)."""
+    from app.services import deactivation as deactivation_service
+    from app.schemas.user import (
+        DeactivateAccountRequest,
+        DeactivateAccountResponse,
+        MemberBriefResponse,
+        TransferResultResponse,
+    )
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if getattr(user, "status", None) == "deactivated":
+        raise HTTPException(status_code=400, detail="账号已注销")
+
+    payload = body or DeactivateAccountRequest(confirm=True)
+    results = deactivation_service.deactivate_user(
+        db,
+        user,
+        owner_transfers=[t.model_dump() for t in payload.owner_transfers],
+        actor=admin,
+        admin=True,
+    )
+    return DeactivateAccountResponse(
+        transfers=[
+            TransferResultResponse(
+                ledger_id=r.ledger_id,
+                ledger_name=r.ledger_name,
+                action=r.action,
+                new_owner=(
+                    MemberBriefResponse(
+                        user_id=r.new_owner.user_id,
+                        display_name=r.new_owner.display_name,
+                        username=r.new_owner.username,
+                    )
+                    if r.new_owner
+                    else None
+                ),
+            )
+            for r in results
+        ]
+    )
+
+
 @router.post("/users/{user_id}/reset-password")
 def admin_reset_user_password(
     user_id: UUID,
@@ -394,6 +451,11 @@ def admin_reset_user_password(
 @router.get("/ledgers", response_model=AdminLedgerListResponse)
 def admin_list_ledgers(
     q: str | None = Query(default=None, description="Search ledger name"),
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        description="active | archived | orphan (archived with no active registered members)",
+    ),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -402,6 +464,25 @@ def admin_list_ledgers(
     query = db.query(Ledger)
     if q and q.strip():
         query = query.filter(Ledger.name.ilike(f"%{q.strip()}%"))
+    sf = (status_filter or "").strip().lower()
+    if sf == "archived":
+        query = query.filter(Ledger.status == "archived")
+    elif sf == "active":
+        query = query.filter((Ledger.status == "active") | (Ledger.status.is_(None)))
+    elif sf == "orphan":
+        # Archived + no non-deactivated registered members
+        active_member_exists = (
+            db.query(LedgerMember.id)
+            .join(User, User.id == LedgerMember.user_id)
+            .filter(
+                LedgerMember.ledger_id == Ledger.id,
+                LedgerMember.user_id.is_not(None),
+                LedgerMember.status == "active",
+                (User.status == "active") | (User.status.is_(None)),
+            )
+            .exists()
+        )
+        query = query.filter(Ledger.status == "archived").filter(~active_member_exists)
     total = query.count()
     ledgers = query.order_by(Ledger.created_at.desc()).offset(offset).limit(limit).all()
     return AdminLedgerListResponse(
@@ -507,6 +588,21 @@ def _ledger_item(db: Session, ledger: Ledger) -> AdminLedgerItem:
         .scalar()
         or 0
     )
+    # Non-deactivated formal members still on the ledger
+    living_member_count = (
+        db.query(func.count(LedgerMember.id))
+        .join(User, User.id == LedgerMember.user_id)
+        .filter(
+            LedgerMember.ledger_id == ledger.id,
+            LedgerMember.user_id.is_not(None),
+            LedgerMember.status == "active",
+            (User.status == "active") | (User.status.is_(None)),
+        )
+        .scalar()
+        or 0
+    )
+    is_archived = (getattr(ledger, "status", None) or "active") == "archived"
+    is_orphan = is_archived and int(living_member_count) == 0
     expenses = (
         db.query(Expense)
         .filter(Expense.ledger_id == ledger.id, Expense.status != ExpenseStatus.REJECTED)
@@ -518,9 +614,15 @@ def _ledger_item(db: Session, ledger: Ledger) -> AdminLedgerItem:
         {
             "member_count": int(member_count),
             "expense_count": len(expenses),
-            "owner_email": owner.email if owner else None,
-            "owner_label": (owner.display_name or owner.username) if owner else None,
+            "owner_email": owner.email if owner and not getattr(owner, "is_deactivated", False) else None,
+            "owner_label": (
+                getattr(owner, "public_display_name", None)
+                or (owner.display_name or owner.username)
+            )
+            if owner
+            else None,
             "total_spend": float(sum(expense_net_amount(e) for e in expenses)),
+            "is_orphan": is_orphan,
         }
     )
     return AdminLedgerItem(**data)

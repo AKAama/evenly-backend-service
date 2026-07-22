@@ -58,6 +58,8 @@ class LedgerResponse(LedgerBase):
     updated_at: datetime
     member_count: int = 0
     expense_count: int = 0
+    status: str = "active"
+    archived_at: datetime | None = None
 
 
 class LedgerWithMembers(LedgerResponse):

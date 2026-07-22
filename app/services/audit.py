@@ -55,13 +55,17 @@ def user_to_response(user: User, db=None) -> "UserResponse":
     resp = UserResponse.model_validate(user)
     kind = getattr(user, "account_kind", None) or "app"
     badge = getattr(user, "badge", None)
+    status = getattr(user, "status", None) or "active"
+    public_name = getattr(user, "public_display_name", None)
     return resp.model_copy(
         update={
             "account_kind": kind,
             "is_admin": is_user_admin(user),
             "badge": badge,
-            "badge_label": badge_label(badge, db),
-            "badge_color": badge_color(badge, db),
+            "badge_label": badge_label(badge, db) if status == "active" else None,
+            "badge_color": badge_color(badge, db) if status == "active" else None,
+            "status": status,
+            "public_display_name": public_name,
         }
     )
 

@@ -1118,7 +1118,7 @@ async def test_avatar_storage_failure_returns_bad_gateway(db, monkeypatch):
     assert exc_info.value.detail == "Avatar storage is temporarily unavailable"
 
 
-def test_delete_account_removes_owned_and_shared_user_data(db):
+def test_deactivate_account_keeps_shared_history_and_archives_solo_ledger(db):
     owner = make_user(db, "owner@example.com", "Owner")
     deleting_user = make_user(db, "delete@example.com", "Delete Me")
     owned_ledger = make_ledger(db, deleting_user)
@@ -1159,22 +1159,65 @@ def test_delete_account_removes_owned_and_shared_user_data(db):
     ))
     db.commit()
 
-    users_router.delete_account(current_user=deleting_user, db=db)
+    from app.schemas.user import DeactivateAccountRequest
 
-    assert db.query(User).filter(User.id == deleting_user.id).first() is None
-    assert db.query(Ledger).filter(Ledger.id == owned_ledger.id).first() is None
-    assert db.query(Ledger).filter(Ledger.id == shared_ledger.id).first() is not None
-    assert db.query(LedgerMember).filter(LedgerMember.user_id == deleting_user.id).count() == 0
-    assert db.query(Expense).filter(Expense.id == expense.id).first() is None
+    users_router.deactivate_account(
+        body=DeactivateAccountRequest(confirm=True, owner_transfers=[]),
+        current_user=deleting_user,
+        db=db,
+    )
+
+    db.expire_all()
+    gone = db.query(User).filter(User.id == deleting_user.id).one()
+    assert gone.status == "deactivated"
+    assert gone.public_display_name.endswith("（已注销）")
+    assert gone.email.startswith("deleted+")
+    # Solo owned ledger archived, not deleted
+    archived = db.query(Ledger).filter(Ledger.id == owned_ledger.id).one()
+    assert archived.status == "archived"
+    assert db.query(Ledger).filter(Ledger.id == shared_ledger.id).one().owner_id == owner.id
+    # History kept
+    assert db.query(LedgerMember).filter(LedgerMember.user_id == deleting_user.id).count() >= 1
+    assert db.query(Expense).filter(Expense.id == expense.id).one() is not None
     assert db.query(Settlement).filter(
         (Settlement.from_user_id == deleting_user.id)
         | (Settlement.to_user_id == deleting_user.id)
-    ).count() == 0
+    ).count() == 1
+
+
+def test_deactivate_transfers_owned_ledger_to_earliest_other_member(db):
+    owner = make_user(db, "own2@example.com", "Owner2")
+    friend = make_user(db, "friend2@example.com", "Friend2")
+    later = make_user(db, "later2@example.com", "Later2")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+    add_member(db, ledger, later)
+    db.commit()
+
+    preview = users_router.deactivation_preview(current_user=owner, db=db)
+    assert len(preview.owned_ledgers_requiring_transfer) == 1
+    assert preview.owned_ledgers_requiring_transfer[0].default_successor.user_id == friend.id
+    assert len(preview.owned_ledgers_to_archive) == 0
+
+    from app.schemas.user import DeactivateAccountRequest
+
+    result = users_router.deactivate_account(
+        body=DeactivateAccountRequest(confirm=True, owner_transfers=[]),
+        current_user=owner,
+        db=db,
+    )
+    db.expire_all()
+    assert result.transfers[0].action == "transfer"
+    assert result.transfers[0].new_owner.user_id == friend.id
+    assert db.query(Ledger).filter(Ledger.id == ledger.id).one().owner_id == friend.id
+    assert db.query(User).filter(User.id == owner.id).one().status == "deactivated"
 
 
 def test_delete_account_endpoint_requires_authentication(client):
     response = client.delete("/users/me")
+    assert response.status_code == 401
 
+    response = client.post("/users/me/deactivate", json={"confirm": True})
     assert response.status_code == 401
 
 
