@@ -35,6 +35,9 @@ class UserResponse(UserBase):
 
     id: UUID
     created_at: datetime
+    # Override EmailStr: deactivated accounts use synthetic placeholders that
+    # email-validator rejects (e.g. historical @invalid.local rows).
+    email: str
     # app | platform (platform = ops console only).
     account_kind: str = "app"
     # True only for platform ops accounts (account_kind=platform).

@@ -1172,6 +1172,13 @@ def test_deactivate_account_keeps_shared_history_and_archives_solo_ledger(db):
     assert gone.status == "deactivated"
     assert gone.public_display_name.endswith("（已注销）")
     assert gone.email.startswith("deleted+")
+    assert gone.email.endswith("@evenly.app")
+    # Deactivated users must still serialize for member lists / admin.
+    from app.services.audit import user_to_response
+
+    resp = user_to_response(gone)
+    assert resp.status == "deactivated"
+    assert resp.public_display_name.endswith("（已注销）")
     # Solo owned ledger archived, not deleted
     archived = db.query(Ledger).filter(Ledger.id == owned_ledger.id).one()
     assert archived.status == "archived"

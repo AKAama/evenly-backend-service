@@ -217,15 +217,33 @@ def deactivate_user(
         )
 
     owner_transfers = owner_transfers or []
-    # Normalize UUID keys
+    # Normalize UUID keys; treat blank strings as omitted (iOS Picker edge cases).
     normalized: list[dict] = []
     for row in owner_transfers:
         lid = row.get("ledger_id")
         nid = row.get("new_owner_id")
+        if isinstance(lid, str) and not lid.strip():
+            lid = None
+        if isinstance(nid, str) and not nid.strip():
+            nid = None
         if lid is not None and not isinstance(lid, UUID):
-            lid = UUID(str(lid))
+            try:
+                lid = UUID(str(lid))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="账本 ID 无效",
+                ) from exc
         if nid is not None and not isinstance(nid, UUID):
-            nid = UUID(str(nid))
+            try:
+                nid = UUID(str(nid))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="新管理员 ID 无效",
+                ) from exc
+        if lid is None:
+            continue
         normalized.append({"ledger_id": lid, "new_owner_id": nid})
 
     plan = _resolve_transfers(db, user, normalized)
@@ -271,9 +289,11 @@ def deactivate_user(
     user.badge = None
     user.updated_at = now
 
-    # Release email immediately (placeholder unique email)
+    # Release email immediately (placeholder unique email).
+    # Must remain a valid EmailStr-compatible address: historical @invalid.local
+    # placeholders broke user_to_response / member lists after deactivation.
     avatar_url = user.avatar_url
-    user.email = f"deleted+{user.id}@invalid.local"
+    user.email = f"deleted+{user.id}@evenly.app"
     user.avatar_url = None
     # Scrub password
     dead_hash = get_password_hash(secrets.token_urlsafe(32))
@@ -290,36 +310,56 @@ def deactivate_user(
         synchronize_session=False,
     )
 
-    db.flush()
+    # Capture audit fields before commit (ORM may expire objects afterward).
+    actor_obj = actor or user
+    audit_actor_id = getattr(actor_obj, "id", None) or user.id
+    from app.services.audit import actor_label, record_audit
 
-    from app.services.audit import record_audit
+    audit_label = actor_label(actor_obj)
+    audit_summary = (
+        f"{'管理员注销' if admin else '注销账号'} {frozen} "
+        f"移交{sum(1 for r in results if r.action == 'transfer')}本 "
+        f"归档{sum(1 for r in results if r.action == 'archive')}本"
+    )
+    audit_metadata = {
+        "transfers": [
+            {
+                "ledger_id": str(r.ledger_id),
+                "ledger_name": r.ledger_name,
+                "action": r.action,
+                "new_owner_id": str(r.new_owner.user_id) if r.new_owner else None,
+            }
+            for r in results
+        ]
+    }
+    resource_user_id = user.id
 
+    # CRITICAL: commit BEFORE record_audit.
+    # record_audit opens a sibling connection and inserts audit_events with
+    # actor_user_id FK → users. If this session still holds an uncommitted
+    # UPDATE on the same user row, the sibling INSERT waits forever while
+    # this request waits for record_audit → application-level deadlock
+    # (seen as idle-in-transaction + Lock/transactionid for minutes).
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    # Pass db only for bind (tests use in-memory SQLite). Safe after commit:
+    # sibling session no longer blocks on uncommitted user row locks.
     record_audit(
         db,
         action="user.deactivate_admin" if admin else "user.deactivate",
-        actor=actor or user,
+        actor=None,
+        actor_user_id=audit_actor_id,
+        actor_label_text=audit_label,
         resource_type="user",
-        resource_id=user.id,
-        summary=(
-            f"{'管理员注销' if admin else '注销账号'} {frozen} "
-            f"移交{sum(1 for r in results if r.action == 'transfer')}本 "
-            f"归档{sum(1 for r in results if r.action == 'archive')}本"
-        ),
-        metadata={
-            "transfers": [
-                {
-                    "ledger_id": str(r.ledger_id),
-                    "ledger_name": r.ledger_name,
-                    "action": r.action,
-                    "new_owner_id": str(r.new_owner.user_id) if r.new_owner else None,
-                }
-                for r in results
-            ]
-        },
+        resource_id=resource_user_id,
+        summary=audit_summary,
+        metadata=audit_metadata,
         request=None,
     )
-
-    db.commit()
 
     # Push after commit so new-owner devices are still valid
     for r in results:

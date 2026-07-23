@@ -49,14 +49,35 @@ def is_user_admin(user: User | None) -> bool:
 
 
 def user_to_response(user: User, db=None) -> "UserResponse":
+    from datetime import datetime
+
+    from pydantic import ValidationError
+
     from app.schemas.user import UserResponse
     from app.services.badges import badge_color, badge_label
 
-    resp = UserResponse.model_validate(user)
     kind = getattr(user, "account_kind", None) or "app"
     badge = getattr(user, "badge", None)
     status = getattr(user, "status", None) or "active"
     public_name = getattr(user, "public_display_name", None)
+    try:
+        resp = UserResponse.model_validate(user)
+    except ValidationError:
+        # Defensive: partial/legacy rows (e.g. bad placeholder email before fix).
+        resp = UserResponse(
+            id=user.id,
+            email=str(getattr(user, "email", None) or f"deleted+{user.id}@evenly.app"),
+            username=str(getattr(user, "username", None) or "user"),
+            display_name=getattr(user, "display_name", None),
+            avatar_url=getattr(user, "avatar_url", None),
+            username_is_generated=bool(getattr(user, "username_is_generated", False)),
+            badge=badge,
+            created_at=getattr(user, "created_at", None) or datetime.utcnow(),
+            account_kind=kind,
+            is_admin=is_user_admin(user),
+            status=status,
+            public_display_name=public_name,
+        )
     return resp.model_copy(
         update={
             "account_kind": kind,
@@ -87,6 +108,7 @@ def record_audit(
     action: str,
     actor: User | None = None,
     actor_user_id: UUID | None = None,
+    actor_label_text: str | None = None,
     resource_type: str | None = None,
     resource_id: str | UUID | None = None,
     ledger_id: UUID | None = None,
@@ -101,6 +123,12 @@ def record_audit(
     Uses the same DB bind as ``db`` when provided (so tests on in-memory SQLite
     work), otherwise the process default engine. Never relies on the request
     session committing later — that was dropping login/create events.
+
+    Important: do not call this while the same request session holds an
+    uncommitted UPDATE/DELETE on ``users`` (or other FK targets of
+    audit_events). The sibling INSERT will wait on that row lock forever —
+    classic app-level deadlock. Commit (or use the same session without a
+    nested commit) first when the actor/user row was modified in this txn.
     """
     from sqlalchemy.orm import sessionmaker
 
@@ -111,7 +139,7 @@ def record_audit(
 
     # Copy primitives off the request session objects (may expire after commit).
     uid = actor_user_id or (actor.id if actor else None)
-    label = actor_label(actor) if actor else None
+    label = actor_label_text if actor_label_text is not None else (actor_label(actor) if actor else None)
     rid = str(resource_id) if resource_id is not None else None
 
     # Source: explicit Request > explicit non-default source > request context > api

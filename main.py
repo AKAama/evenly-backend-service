@@ -80,15 +80,27 @@ async def request_timing_middleware(request: Request, call_next):
 
 @app.exception_handler(SQLAlchemyError)
 async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
-    logger.exception(
-        "数据库异常 | %s %s",
-        request.method,
-        request.url.path,
-        exc_info=exc,
-    )
+    from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
+
+    if isinstance(exc, (OperationalError, SATimeoutError)):
+        logger.exception(
+            "数据库连接异常（超时/断线）| %s %s",
+            request.method,
+            request.url.path,
+            exc_info=exc,
+        )
+        detail = "数据库连接异常，请稍后重试"
+    else:
+        logger.exception(
+            "数据库异常 | %s %s",
+            request.method,
+            request.url.path,
+            exc_info=exc,
+        )
+        detail = "数据库暂时不可用"
     return JSONResponse(
         status_code=503,
-        content={"detail": "Database is not ready"},
+        content={"detail": detail},
     )
 
 # CORS middleware
