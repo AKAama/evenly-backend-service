@@ -112,7 +112,12 @@ def admin_list_users(
 
     items: list[AdminUserItem] = []
     for u in users:
-        base = user_to_response(u)
+        try:
+            base = user_to_response(u)
+        except Exception:
+            # Never let one bad row (legacy email / partial columns) zero the whole admin home.
+            logger.exception("admin list users: skip user_id=%s", getattr(u, "id", None))
+            continue
         membership_count = (
             db.query(func.count(LedgerMember.id))
             .filter(LedgerMember.user_id == u.id, LedgerMember.status == "active")
@@ -500,10 +505,13 @@ def admin_list_ledgers(
         query = query.filter(Ledger.status == "archived").filter(~active_member_exists)
     total = query.count()
     ledgers = query.order_by(Ledger.created_at.desc()).offset(offset).limit(limit).all()
-    return AdminLedgerListResponse(
-        total=total,
-        items=[_ledger_item(db, ledger) for ledger in ledgers],
-    )
+    items: list[AdminLedgerItem] = []
+    for ledger in ledgers:
+        try:
+            items.append(_ledger_item(db, ledger))
+        except Exception:
+            logger.exception("admin list ledgers: skip ledger_id=%s", getattr(ledger, "id", None))
+    return AdminLedgerListResponse(total=total, items=items)
 
 
 @router.get("/ledgers/{ledger_id}/overview", response_model=LedgerOverviewResponse)
@@ -524,19 +532,29 @@ def admin_ledger_overview(
         .all()
     )
     active_members = [m for m in members if m.status == "active"]
-    member_responses = [
-        LedgerMemberWithUser(
-            id=member.id,
-            user_id=member.user_id,
-            nickname=member.nickname,
-            joined_at=member.joined_at,
-            user=user_to_response(member.user) if member.user else None,
-            is_temporary=member.is_temporary,
-            temporary_name=member.temporary_name,
-            status=member.status,
+    member_responses: list[LedgerMemberWithUser] = []
+    for member in members:
+        user_resp = None
+        if member.user is not None:
+            try:
+                user_resp = user_to_response(member.user)
+            except Exception:
+                logger.exception(
+                    "admin ledger overview: skip member user_id=%s",
+                    member.user_id,
+                )
+        member_responses.append(
+            LedgerMemberWithUser(
+                id=member.id,
+                user_id=member.user_id,
+                nickname=member.nickname,
+                joined_at=member.joined_at,
+                user=user_resp,
+                is_temporary=member.is_temporary,
+                temporary_name=member.temporary_name,
+                status=member.status,
+            )
         )
-        for member in members
-    ]
 
     expenses = (
         db.query(Expense)
