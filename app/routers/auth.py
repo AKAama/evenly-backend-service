@@ -136,7 +136,7 @@ async def register(
     # Handle avatar upload
     avatar_url = None
     if avatar:
-        logger.info(f"Avatar uploaded: {avatar.filename}, content_type: {avatar.content_type}")
+        logger.info("注册：收到头像文件 filename=%s content_type=%s", avatar.filename, avatar.content_type)
         if settings.cos:
             try:
                 # Validate file type
@@ -155,12 +155,12 @@ async def register(
                         detail="File too large. Max size: 5MB"
                     )
 
-                logger.info(f"Uploading avatar to COS: {avatar.filename}")
+                logger.info("注册：上传头像到 COS filename=%s", avatar.filename)
 
                 # Upload to COS
                 cos_service = get_cos_service()
                 if cos_service is None:
-                    logger.error("COS service is None")
+                    logger.error("注册：COS 服务不可用")
                     raise HTTPException(
                         status_code=500,
                         detail="COS service not available"
@@ -171,13 +171,13 @@ async def register(
                     filename=avatar.filename,
                     folder="avatars"
                 )
-                logger.info(f"Avatar uploaded successfully: {avatar_url}")
+                logger.info("注册：头像上传成功 url=%s", avatar_url)
             except Exception as e:
-                logger.error(f"Failed to upload avatar: {str(e)}")
+                logger.error("注册：头像上传失败 error=%s", e)
                 # Continue without avatar if upload fails
                 avatar_url = None
         else:
-            logger.warning("COS not configured, skipping avatar upload")
+            logger.warning("注册：未配置 COS，跳过头像上传")
 
     # Create user
     user_data = UserCreate(
@@ -188,7 +188,13 @@ async def register(
         avatar_url=avatar_url
     )
     db_user = create_user(db, user_data)
-    logger.info(f"User created: {db_user.email}, avatar_url: {db_user.avatar_url}")
+    logger.info(
+        "注册成功 user_id=%s 用户名=%s 邮箱=%s 有头像=%s",
+        db_user.id,
+        db_user.username,
+        db_user.email,
+        bool(db_user.avatar_url),
+    )
 
     # Generate token immediately
     access_token = create_access_token(
@@ -236,6 +242,7 @@ def login(
     user = authenticate_user(db, type("UserLogin", (), {"identifier": form_data.username, "password": form_data.password})())
 
     if not user:
+        logger.warning("登录失败：账号或密码错误 identifier=%s IP=%s", identifier, ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -251,6 +258,13 @@ def login(
     from app.services.audit import record_audit
 
     is_platform = getattr(user, "account_kind", None) == "platform"
+    logger.info(
+        "登录成功 user_id=%s 用户名=%s 类型=%s IP=%s",
+        user.id,
+        user.username,
+        "平台账号" if is_platform else "普通用户",
+        ip,
+    )
     record_audit(
         db,
         action="auth.login",
@@ -348,6 +362,12 @@ def login_with_apple(
     set_auth_cookie(response, access_token)
     from app.services.audit import record_audit
 
+    logger.info(
+        "Apple 登录成功 user_id=%s 用户名=%s IP=%s",
+        user.id,
+        user.username,
+        ip,
+    )
     record_audit(
         db,
         action="auth.apple_login",

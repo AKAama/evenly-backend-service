@@ -158,7 +158,7 @@ def record_audit(
         session.add(event)
         session.commit()
     except Exception:
-        logger.exception("audit log failed action=%s", action)
+        logger.exception("写入审计日志失败 action=%s", action)
         try:
             session.rollback()
         except Exception:

@@ -159,7 +159,7 @@ async def upload_avatar(
     # Validate file size (max 5MB)
     contents = await file.read()
     logger.info(
-        "Avatar upload received user_id=%s filename=%s content_type=%s size=%d",
+        "上传头像 user_id=%s filename=%s content_type=%s size=%d",
         current_user.id,
         file.filename,
         file.content_type,
@@ -182,7 +182,7 @@ async def upload_avatar(
             folder="avatars"
         )
     except Exception as exc:
-        logger.exception("Avatar storage failed user_id=%s: %s", current_user.id, exc)
+        logger.exception("头像存储失败 user_id=%s: %s", current_user.id, exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Avatar storage is temporarily unavailable",
@@ -197,7 +197,7 @@ async def upload_avatar(
     db.commit()
     db.refresh(current_user)
 
-    logger.info("Avatar updated user_id=%s", current_user.id)
+    logger.info("头像已更新 user_id=%s", current_user.id)
 
     return current_user
 

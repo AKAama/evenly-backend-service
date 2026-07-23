@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
@@ -36,6 +37,7 @@ from app.services.auth import set_password
 from app.services.settlement import expense_net_amount, expense_scaled_split_amounts
 from app.utils.deps import get_current_user, get_ledger_or_404
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin-ops"])
 
 
@@ -235,6 +237,12 @@ def admin_create_badge(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     source = x_client.strip().lower() if isinstance(x_client, str) and x_client.strip() else "console"
+    logger.info(
+        "运营创建徽章 key=%s label=%s 操作者=%s",
+        row.key,
+        row.label,
+        admin.username,
+    )
     record_audit(
         db,
         action="badge.create",
@@ -309,6 +317,7 @@ def admin_delete_badge(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     source = x_client.strip().lower() if isinstance(x_client, str) and x_client.strip() else "console"
+    logger.info("运营删除徽章 key=%s 操作者=%s", key, admin.username)
     record_audit(
         db,
         action="badge.delete",
@@ -379,6 +388,12 @@ def admin_deactivate_user(
     if getattr(user, "status", None) == "deactivated":
         raise HTTPException(status_code=400, detail="账号已注销")
 
+    logger.info(
+        "运营强制注销用户 target_user=%s target_username=%s 操作者=%s",
+        user.id,
+        user.username,
+        admin.username,
+    )
     payload = body or DeactivateAccountRequest(confirm=True)
     results = deactivation_service.deactivate_user(
         db,

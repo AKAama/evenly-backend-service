@@ -50,11 +50,11 @@ def allow_request(bucket: str, *, limit: int, window_seconds: int) -> bool:
             if count == 1:
                 client.expire(key, window_seconds)
             if count > limit:
-                logger.info("Rate limit hit bucket=%s count=%s limit=%s", bucket, count, limit)
+                logger.info("触发限流 bucket=%s 次数=%s 上限=%s", bucket, count, limit)
                 return False
             return True
         except RedisError:
-            logger.exception("Redis rate limit failed; falling back to memory bucket=%s", bucket)
+            logger.exception("Redis 限流失败，回退内存计数 bucket=%s", bucket)
 
     return _memory_allow(bucket, limit, window_seconds)
 

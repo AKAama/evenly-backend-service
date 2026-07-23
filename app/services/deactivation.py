@@ -347,14 +347,15 @@ def deactivate_user(
             if cos_service is not None:
                 cos_service.delete_file(avatar_url)
         except Exception:
-            logger.exception("Avatar cleanup failed for deactivated user_id=%s", user.id)
+            logger.exception("注销账号：清理头像失败 user_id=%s", user.id)
 
     logger.info(
-        "Account deactivated user_id=%s transfers=%d archives=%d admin=%s",
+        "账号已注销 user_id=%s 用户名=%s 转让账本=%d 归档账本=%d 操作方=%s",
         user.id,
+        getattr(user, "username", None),
         sum(1 for r in results if r.action == "transfer"),
         sum(1 for r in results if r.action == "archive"),
-        admin,
+        "管理员" if admin else "本人",
     )
     return results
 

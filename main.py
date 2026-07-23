@@ -11,8 +11,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.config import settings
 from app.database import engine
 from app.routers import auth, ledgers, expenses, settlements, test_users, users, audit, platform_users, admin_ops
+from app.services.access_log import format_access_line, try_user_hint_from_request
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -24,14 +29,14 @@ app = FastAPI(
 
 @app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
-    """Bind client IP / X-Client into contextvars so record_audit always sees them."""
+    """把客户端 IP / X-Client 绑到 contextvars，供审计写入使用。"""
     from app.services.request_context import bind_request_context, reset_request_context
 
     tokens = None
     try:
         tokens = bind_request_context(request)
     except Exception:
-        logger.exception("failed to bind request context")
+        logger.exception("绑定请求上下文失败 path=%s", request.url.path)
     try:
         return await call_next(request)
     finally:
@@ -40,6 +45,9 @@ async def request_context_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def request_timing_middleware(request: Request, call_next):
+    """每个 HTTP 请求打一行中文可读访问日志。"""
+    from app.services.request_context import get_request_ip, get_request_source
+
     started_at = perf_counter()
     status_code = 500
     try:
@@ -52,21 +60,28 @@ async def request_timing_middleware(request: Request, call_next):
     finally:
         elapsed_ms = (perf_counter() - started_at) * 1000
         is_slow = elapsed_ms >= settings.slow_request_threshold_ms
-        logger.log(
-            logging.WARNING if is_slow else logging.INFO,
-            "HTTP %s %s status=%d duration_ms=%.2f slow=%s",
-            request.method,
-            request.url.path,
-            status_code,
-            elapsed_ms,
-            str(is_slow).lower(),
-        )
+        # 探活请求降噪：正常 200 不打日志
+        path = request.url.path
+        if path in {"/health", "/ready", "/"} and status_code < 400 and not is_slow:
+            pass
+        else:
+            line = format_access_line(
+                method=request.method,
+                path=path,
+                status_code=status_code,
+                duration_ms=elapsed_ms,
+                slow=is_slow,
+                client_source=get_request_source(),
+                client_ip=get_request_ip(),
+                user_hint=try_user_hint_from_request(request),
+            )
+            logger.log(logging.WARNING if is_slow or status_code >= 500 else logging.INFO, "%s", line)
 
 
 @app.exception_handler(SQLAlchemyError)
 async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
     logger.exception(
-        "Database error while handling %s %s",
+        "数据库异常 | %s %s",
         request.method,
         request.url.path,
         exc_info=exc,
@@ -122,7 +137,7 @@ async def readiness_check():
         with engine.connect() as connection:
             connection.execute(text("select 1"))
     except SQLAlchemyError as exc:
-        logger.exception("Database readiness check failed", exc_info=exc)
+        logger.exception("就绪检查：数据库不可用", exc_info=exc)
         raise HTTPException(status_code=503, detail="Database is not ready") from exc
 
     redis = redis_status()

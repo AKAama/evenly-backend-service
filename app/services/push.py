@@ -91,7 +91,7 @@ def _provider_token() -> str | None:
             if cached:
                 return cached
         except RedisError:
-            logger.exception("Failed to read cached APNs provider token")
+            logger.exception("读取缓存的 APNs provider token 失败")
 
     token = _mint_provider_token()
     if token is None:
@@ -100,9 +100,9 @@ def _provider_token() -> str | None:
     if client is not None:
         try:
             client.set(_APNS_TOKEN_CACHE_KEY, token, ex=_APNS_TOKEN_TTL_SECONDS)
-            logger.info("Cached APNs provider token ttl=%ss", _APNS_TOKEN_TTL_SECONDS)
+            logger.info("已缓存 APNs provider token ttl=%ss", _APNS_TOKEN_TTL_SECONDS)
         except RedisError:
-            logger.exception("Failed to cache APNs provider token")
+            logger.exception("缓存 APNs provider token 失败")
     return token
 
 
@@ -110,8 +110,7 @@ def send_push_to_users(db: Session, user_ids: Iterable[UUID], payload: dict) -> 
     auth_token = _provider_token()
     if auth_token is None:
         logger.warning(
-            "APNs not configured (set APNS_TEAM_ID / APNS_KEY_ID / APNS_PRIVATE_KEY); "
-            "skipping event=%s user_count=%d",
+            "APNs 未配置（需 APNS_TEAM_ID / APNS_KEY_ID / APNS_PRIVATE_KEY），跳过推送 event=%s 用户数=%d",
             payload.get("event"),
             len(set(user_ids)),
         )
@@ -125,13 +124,13 @@ def send_push_to_users(db: Session, user_ids: Iterable[UUID], payload: dict) -> 
     ).all()
     if not devices:
         logger.info(
-            "No active push devices for event=%s user_count=%d",
+            "无活跃推送设备 event=%s 用户数=%d",
             payload.get("event"),
             len(ids),
         )
         return
     logger.info(
-        "Dispatching APNs event=%s devices=%d users=%d",
+        "下发 APNs 推送 event=%s 设备数=%d 用户数=%d",
         payload.get("event"),
         len(devices),
         len(ids),
@@ -151,7 +150,7 @@ def send_push_to_users(db: Session, user_ids: Iterable[UUID], payload: dict) -> 
             )
             if response.status_code == 200:
                 logger.info(
-                    "APNs delivered event=%s env=%s token=%s…",
+                    "APNs 推送成功 event=%s env=%s token=%s…",
                     payload.get("event"),
                     device.environment,
                     device.token[:12],
@@ -161,7 +160,7 @@ def send_push_to_users(db: Session, user_ids: Iterable[UUID], payload: dict) -> 
             if reason in {"BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"}:
                 device.is_active = False
             logger.warning(
-                "APNs delivery failed event=%s status=%d reason=%s env=%s token=%s…",
+                "APNs 推送失败 event=%s status=%d reason=%s env=%s token=%s…",
                 payload.get("event"),
                 response.status_code,
                 reason,
@@ -175,4 +174,4 @@ def send_push_safely(db: Session, user_ids: Iterable[UUID], payload: dict) -> No
     try:
         send_push_to_users(db, user_ids, payload)
     except Exception:
-        logger.exception("APNs dispatch failed event=%s", payload.get("event"))
+        logger.exception("APNs 下发异常 event=%s", payload.get("event"))

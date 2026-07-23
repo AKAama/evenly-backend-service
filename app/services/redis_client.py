@@ -41,10 +41,10 @@ def get_redis() -> Redis | None:
         # Fail fast if the instance is unreachable so callers can degrade cleanly.
         client.ping()
         _redis_client = client
-        logger.info("Redis client connected")
+        logger.info("Redis 已连接")
         return _redis_client
     except RedisError:
-        logger.exception("Redis unavailable; features will fall back where possible")
+        logger.exception("Redis 不可用，相关功能将降级")
         _redis_client = None
         return None
 

@@ -70,7 +70,7 @@ def _send_with_redis(email: str, code: str, purpose: str) -> bool | None:
         )
         return True
     except RedisError:
-        logger.exception("Redis verification store unavailable; falling back to in-memory store")
+        logger.exception("Redis 验证码存储不可用，回退内存")
         return None
 
 
@@ -89,7 +89,7 @@ def _verify_with_redis(email: str, code: str, purpose: str) -> bool | None:
         client.delete(_send_lock_key(email, purpose))
         return True
     except RedisError:
-        logger.exception("Redis verification store unavailable; falling back to in-memory store")
+        logger.exception("Redis 验证码存储不可用，回退内存")
         return None
 
 
@@ -127,7 +127,7 @@ def send_verification_code(email: str, purpose: str = "register") -> bool:
     if email_service:
         return email_service.send_verification_code(normalized_email, code)
 
-    logger.warning("Email service is not configured; verification code generated for %s", normalized_email)
+    logger.warning("邮件服务未配置，验证码已生成但未发送 email=%s", normalized_email)
     return True
 
 

@@ -118,7 +118,7 @@ def create_ledger(
 
     reject_if_platform_for_app(current_user)
     logger.info(
-        "Creating ledger name=%s owner_id=%s initial_members=%d",
+        "创建账本 name=%s owner_id=%s 初始成员数=%d",
         ledger.name,
         current_user.id,
         len(ledger.members),
@@ -457,7 +457,7 @@ def join_via_invite_link(
     db.refresh(member)
     invitation_cache.invalidate_pending_invitations(current_user.id)
     logger.info(
-        "User joined via invite link ledger_id=%s user_id=%s token=%s",
+        "通过邀请链接加入账本 ledger_id=%s user_id=%s token=%s…",
         ledger.id,
         current_user.id,
         token[:6],
@@ -826,7 +826,7 @@ async def upload_ledger_cover(
             folder="ledger-covers",
         )
     except Exception as exc:
-        logger.exception("Ledger cover upload failed ledger_id=%s: %s", ledger_id, exc)
+        logger.exception("账本封面上传失败 ledger_id=%s: %s", ledger_id, exc)
         raise HTTPException(status_code=502, detail="封面上传暂时不可用") from exc
 
     old_url = ledger.cover_url
@@ -839,7 +839,7 @@ async def upload_ledger_cover(
         try:
             cos_service.delete_file(old_url)
         except Exception:
-            logger.warning("Failed to delete old ledger cover url=%s", old_url)
+            logger.warning("删除旧账本封面失败 url=%s", old_url)
 
     record_audit(
         db,
@@ -904,7 +904,7 @@ def delete_ledger_cover(
             if cos is not None:
                 cos.delete_file(old_url)
         except Exception:
-            logger.warning("Failed to delete ledger cover from COS url=%s", old_url)
+            logger.warning("从 COS 删除账本封面失败 url=%s", old_url)
 
     record_audit(
         db,
@@ -971,7 +971,7 @@ def add_member(
     """Add a member to the ledger (only owner can add)"""
     ledger = get_ledger_or_404(db, ledger_id)
     logger.info(
-        "Adding ledger member ledger_id=%s actor_id=%s user_id=%s is_temporary=%s temporary_name=%s",
+        "添加账本成员 ledger_id=%s 操作者=%s user_id=%s 临时成员=%s 临时名=%s",
         ledger_id,
         current_user.id,
         request.user_id,
@@ -981,7 +981,7 @@ def add_member(
 
     if ledger.owner_id != current_user.id:
         logger.warning(
-            "Non-owner add member attempt ledger_id=%s actor_id=%s owner_id=%s",
+            "非所有者尝试添加成员 ledger_id=%s 操作者=%s 所有者=%s",
             ledger_id,
             current_user.id,
             ledger.owner_id,
@@ -991,7 +991,7 @@ def add_member(
     # Handle temporary members
     if request.is_temporary:
         if not request.temporary_name:
-            logger.warning("Temporary member add missing name ledger_id=%s actor_id=%s", ledger_id, current_user.id)
+            logger.warning("添加临时成员缺少名称 ledger_id=%s 操作者=%s", ledger_id, current_user.id)
             raise HTTPException(status_code=400, detail="Temporary name is required")
         
         # Check if temporary member already exists
@@ -1019,7 +1019,7 @@ def add_member(
 
         if existing:
             logger.info(
-                "Duplicate temporary member add rejected ledger_id=%s temporary_name=%s",
+                "拒绝重复添加临时成员 ledger_id=%s 临时名=%s",
                 ledger_id,
                 request.temporary_name,
             )
@@ -1035,7 +1035,7 @@ def add_member(
         db.add(member)
         db.commit()
         db.refresh(member)
-        logger.info("Added temporary member ledger_id=%s member_id=%s", ledger_id, member.id)
+        logger.info("已添加临时成员 ledger_id=%s member_id=%s", ledger_id, member.id)
 
         return MemberResponse(
             id=member.id,
@@ -1049,13 +1049,13 @@ def add_member(
 
     # Handle regular members
     if not request.user_id:
-        logger.warning("Regular member add missing user_id ledger_id=%s actor_id=%s", ledger_id, current_user.id)
+        logger.warning("添加正式成员缺少 user_id ledger_id=%s 操作者=%s", ledger_id, current_user.id)
         raise HTTPException(status_code=400, detail="User ID is required for non-temporary members")
 
     # Check if user exists
     user = db.query(User).filter(User.id == request.user_id).first()
     if not user:
-        logger.warning("Regular member add user not found ledger_id=%s user_id=%s", ledger_id, request.user_id)
+        logger.warning("添加正式成员：用户不存在 ledger_id=%s user_id=%s", ledger_id, request.user_id)
         raise HTTPException(status_code=404, detail="User not found")
 
     # Check if already a member (regular or temporary)
@@ -1072,7 +1072,7 @@ def add_member(
         db.commit()
         db.refresh(existing)
         logger.info(
-            "Re-invited regular member ledger_id=%s member_id=%s user_id=%s previous_status=%s",
+            "重新邀请正式成员 ledger_id=%s member_id=%s user_id=%s 原状态=%s",
             ledger_id,
             existing.id,
             request.user_id,
@@ -1098,7 +1098,7 @@ def add_member(
 
     if existing:
         logger.info(
-            "Duplicate regular member add rejected ledger_id=%s user_id=%s status=%s",
+            "拒绝重复添加正式成员 ledger_id=%s user_id=%s 状态=%s",
             ledger_id,
             request.user_id,
             existing.status,
@@ -1119,7 +1119,7 @@ def add_member(
     db.add(member)
     db.commit()
     db.refresh(member)
-    logger.info("Invited regular member ledger_id=%s member_id=%s user_id=%s", ledger_id, member.id, request.user_id)
+    logger.info("已邀请正式成员 ledger_id=%s member_id=%s user_id=%s", ledger_id, member.id, request.user_id)
 
     invitation_cache.invalidate_pending_invitations(request.user_id)
     send_push_safely(db, [request.user_id], build_payload(

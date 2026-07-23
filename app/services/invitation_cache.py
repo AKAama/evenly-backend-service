@@ -35,7 +35,7 @@ def get_pending_invitations(user_id: UUID | str) -> list[dict[str, Any]] | None:
             return None
         return data
     except (RedisError, json.JSONDecodeError, TypeError):
-        logger.exception("Failed to read pending invitations cache user_id=%s", user_id)
+        logger.exception("读取待处理邀请缓存失败 user_id=%s", user_id)
         return None
 
 
@@ -50,7 +50,7 @@ def set_pending_invitations(user_id: UUID | str, payloads: list[dict[str, Any]])
             ex=PENDING_INVITES_TTL_SECONDS,
         )
     except RedisError:
-        logger.exception("Failed to write pending invitations cache user_id=%s", user_id)
+        logger.exception("写入待处理邀请缓存失败 user_id=%s", user_id)
 
 
 def invalidate_pending_invitations(user_id: UUID | str | None) -> None:
@@ -61,9 +61,9 @@ def invalidate_pending_invitations(user_id: UUID | str | None) -> None:
         return
     try:
         client.delete(_key(user_id))
-        logger.info("Invalidated pending invitations cache user_id=%s", user_id)
+        logger.info("已失效待处理邀请缓存 user_id=%s", user_id)
     except RedisError:
-        logger.exception("Failed to invalidate pending invitations cache user_id=%s", user_id)
+        logger.exception("失效待处理邀请缓存失败 user_id=%s", user_id)
 
 
 def invalidate_pending_invitations_many(user_ids: list[UUID | str | None]) -> None:
