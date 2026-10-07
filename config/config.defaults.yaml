@@ -62,3 +62,10 @@ slow_request_threshold_ms: 20.0
 # apns_private_key_path: "AuthKey_YYYYYYYYYY.p8"
 # apns_bundle_id: "com.yhma.Evenly"
 # Inline PEM (or APNS_PRIVATE_KEY env) is still supported if needed.
+
+# Optional iOS update reminder. Enable only after App Store release is available.
+# ios_latest_version: "1.2.0"
+ios_latest_version: ""
+# 备用文案；优先使用 app/resources/ios-changelog.json 中对应版本的标题和前 3 条内容。
+ios_update_message: "新版本已发布，建议更新以获得更好的使用体验。"
+ios_update_remind_after_days: 3

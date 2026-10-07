@@ -10,7 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
 from app.database import engine
-from app.routers import auth, ledgers, expenses, settlements, test_users, users, audit, platform_users, admin_ops
+from app.routers import auth, ledgers, expenses, settlements, test_users, users, audit, platform_users, admin_ops, app_updates
 from app.services.access_log import format_access_line, try_user_hint_from_request
 
 logging.basicConfig(
@@ -123,6 +123,7 @@ app.include_router(test_users.router)
 app.include_router(audit.router)
 app.include_router(platform_users.router)
 app.include_router(admin_ops.router)
+app.include_router(app_updates.router)
 
 
 @app.get("/")

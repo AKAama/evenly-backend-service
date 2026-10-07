@@ -80,6 +80,7 @@ class COSService:
         client = CosS3Client(self.config)
 
         presigned_url = client.get_presigned_url(
+            Method="GET",
             Bucket=self.bucket,
             Key=key,
             Expired=expires,

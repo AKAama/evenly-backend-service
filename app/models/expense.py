@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime, date
 from sqlalchemy import (
+    JSON,
     CheckConstraint,
     Column,
     String,
@@ -46,6 +47,7 @@ class Expense(Base):
     total_amount = Column(Numeric(12, 2), nullable=False)
     # Partial refund from merchant/etc. Effective spend = total_amount - refund_amount.
     refund_amount = Column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    receipt_urls = Column(JSON, nullable=False, default=list, server_default="[]")
     note = Column(Text)
     category = Column(String(50), nullable=True)
     icon_type = Column(String(20), nullable=True)

@@ -1465,6 +1465,43 @@ def test_create_expense_allows_temporary_member_split(db):
     assert next(split for split in splits if split.member_id == temporary_member.id).user_id is None
 
 
+def test_settlement_flow_includes_temporary_member(db):
+    owner = make_user(db, "temp-settlement-owner@example.com", "Owner")
+    ledger = make_ledger(db, owner, with_temp_member=True)
+    owner_member = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == ledger.id,
+        LedgerMember.user_id == owner.id,
+    ).one()
+    temporary_member = db.query(LedgerMember).filter(
+        LedgerMember.ledger_id == ledger.id,
+        LedgerMember.user_id.is_(None),
+    ).one()
+
+    create_expense(
+        ledger.id,
+        ExpenseCreate(
+            title="Temporary member lunch",
+            total_amount=Decimal("20.00"),
+            expense_date=date.today(),
+            payer_id=owner.id,
+            splits=[
+                ExpenseSplitCreate(member_id=owner_member.id, amount=Decimal("10.00")),
+                ExpenseSplitCreate(member_id=temporary_member.id, amount=Decimal("10.00")),
+            ],
+        ),
+        db=db,
+        current_user=owner,
+    )
+
+    suggestions = get_settlements(ledger.id, db=db, current_user=owner)
+
+    assert len(suggestions) == 1
+    assert suggestions[0].from_user_id == temporary_member.id
+    assert suggestions[0].from_user_name == temporary_member.display_name
+    assert suggestions[0].to_user_id == owner.id
+    assert suggestions[0].amount == Decimal("10.00")
+
+
 def test_create_expense_resolves_member_id_from_registered_user_id(db):
     owner = make_user(db, "owner@example.com", "Owner")
     friend = make_user(db, "friend@example.com", "Friend")
@@ -2463,3 +2500,446 @@ def test_platform_user_cannot_create_ledger(db):
         assert False, "expected HTTPException"
     except HTTPException as exc:
         assert exc.status_code == 403
+
+
+def test_participant_can_correct_own_rejection(db):
+    owner = make_user(db, "correction-owner@example.com", "Owner")
+    first = make_user(db, "correction-first@example.com", "First")
+    second = make_user(db, "correction-second@example.com", "Second")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, first)
+    add_member(db, ledger, second)
+    expense = create_expense(ledger.id, ExpenseCreate(
+        title="Correct mistaken rejection",
+        total_amount=Decimal("30.00"),
+        expense_date=date.today(),
+        payer_id=owner.id,
+        splits=[ExpenseSplitCreate(user_id=user.id, amount=Decimal("10.00"))
+                for user in (owner, first, second)],
+    ), db=db, current_user=owner)
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="rejected"), db=db, current_user=first)
+    assert expense.status == ExpenseStatus.REJECTED
+    with pytest.raises(HTTPException) as exc_info:
+        confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=second)
+    assert_http_error(exc_info, 400)
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=first)
+    assert expense.status == ExpenseStatus.PENDING
+    records = db.query(ExpenseConfirmation).filter_by(expense_id=expense.id, user_id=first.id).all()
+    assert len(records) == 1
+    assert records[0].status == "confirmed"
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="rejected"), db=db, current_user=second)
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=second)
+    assert expense.status == ExpenseStatus.CONFIRMED
+
+
+def test_correcting_rejection_preserves_other_rejections(db):
+    owner = make_user(db, "other-owner@example.com", "Owner")
+    first = make_user(db, "other-first@example.com", "First")
+    second = make_user(db, "other-second@example.com", "Second")
+    ledger = make_ledger(db, owner)
+    for user in (first, second):
+        add_member(db, ledger, user)
+    expense = create_expense(ledger.id, ExpenseCreate(
+        title="Multiple rejections", total_amount=Decimal("30.00"),
+        expense_date=date.today(), payer_id=owner.id,
+        splits=[ExpenseSplitCreate(user_id=user.id, amount=Decimal("10.00"))
+                for user in (owner, first, second)],
+    ), db=db, current_user=owner)
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="rejected"), db=db, current_user=first)
+    db.add(ExpenseConfirmation(expense_id=expense.id, user_id=second.id, status="rejected"))
+    db.commit()
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=first)
+    assert expense.status == ExpenseStatus.REJECTED
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=second)
+    assert expense.status == ExpenseStatus.CONFIRMED
+
+
+def test_cover_upload_persists_url_in_ledger_responses(db, monkeypatch):
+    from app.routers.ledgers import upload_ledger_cover
+    from app.services import cos
+    owner = make_user(db, "cover-owner@example.com", "Owner")
+    ledger = make_ledger(db, owner)
+    cover_url = "https://example.com/ledger-covers/test.jpg"
+
+    class FakeCOS:
+        def upload_file(self, file_data, filename, folder):
+            assert file_data == b"image-test"
+            assert filename == "cover.jpg"
+            assert folder == "ledger-covers"
+            return cover_url
+
+    monkeypatch.setattr(app_settings, "cos", object())
+    monkeypatch.setattr(cos, "get_cos_service", lambda: FakeCOS())
+    file = UploadFile(filename="cover.jpg", file=BytesIO(b"image-test"),
+                      headers=Headers({"content-type": "image/jpeg"}))
+    response = asyncio.run(upload_ledger_cover(ledger.id, file=file, db=db, current_user=owner))
+    assert response.cover_url == cover_url
+    assert get_ledger(ledger.id, db=db, current_user=owner).cover_url == cover_url
+    assert get_ledgers(db=db, current_user=owner)[0].cover_url == cover_url
+
+
+def test_failed_cover_upload_preserves_previous_cover(db, monkeypatch):
+    from app.routers.ledgers import upload_ledger_cover
+    from app.services import cos
+    owner = make_user(db, "failed-cover-owner@example.com", "Owner")
+    ledger = make_ledger(db, owner)
+    ledger.cover_url = "https://example.com/old.jpg"
+    db.commit()
+
+    class FakeCOS:
+        def upload_file(self, **kwargs):
+            raise RuntimeError("Storage unavailable")
+
+    monkeypatch.setattr(app_settings, "cos", object())
+    monkeypatch.setattr(cos, "get_cos_service", lambda: FakeCOS())
+    file = UploadFile(filename="cover.jpg", file=BytesIO(b"image-test"),
+                      headers=Headers({"content-type": "image/jpeg"}))
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(upload_ledger_cover(ledger.id, file=file, db=db, current_user=owner))
+    assert_http_error(exc_info, 502)
+    db.refresh(ledger)
+    assert ledger.cover_url == "https://example.com/old.jpg"
+
+
+@pytest.fixture()
+def receipt_context(db, monkeypatch):
+    from app.config import COSConfig
+    from app.services import cos
+    from app.utils.deps import get_current_user
+    owner = make_user(db, "receipt-owner@example.com", "Owner")
+    friend = make_user(db, "receipt-friend@example.com", "Friend")
+    ledger = make_ledger(db, owner)
+    add_member(db, ledger, friend)
+    monkeypatch.setattr(app_settings, "cos", COSConfig(
+        secret_id="test", secret_key="test", region="test", bucket="test", cdn_domain="receipts.example.com"))
+
+    class FakeCOS:
+        def __init__(self):
+            self.uploaded = []
+            self.deleted = []
+            self.signed = []
+            self.fail_after = None
+
+        def upload_file(self, file_data, filename, folder):
+            assert folder == f"receipts/{ledger.id}/{owner.id}"
+            if self.fail_after is not None and len(self.uploaded) >= self.fail_after:
+                raise RuntimeError("Storage unavailable")
+            url = f"https://receipts.example.com/{folder}/{uuid.uuid4()}.jpg"
+            self.uploaded.append(url)
+            return url
+
+        def delete_file(self, url):
+            self.deleted.append(url)
+            return True
+
+        def get_presigned_url(self, key, expires=3600):
+            self.signed.append((key, expires))
+            return f"https://test.cos.test.myqcloud.com/{key}?q-signature=test"
+
+    storage = FakeCOS()
+    monkeypatch.setattr(cos, "get_cos_service", lambda: storage)
+    app.dependency_overrides[get_current_user] = lambda: owner
+    payload = {
+        "title": "Dinner with receipts", "total_amount": "20.00", "expense_date": str(date.today()),
+        "payer_id": str(owner.id), "splits": [
+            {"user_id": str(owner.id), "amount": "10.00"},
+            {"user_id": str(friend.id), "amount": "10.00"},
+        ],
+    }
+    return ledger, owner, payload, storage
+
+
+def receipt_files(count):
+    return [("files", (f"receipt-{i}.jpg", b"\xff\xd8\xffreceipt-image", "image/jpeg")) for i in range(count)]
+
+
+def test_receipt_multipart_saves_three_images_and_returns_in_details(client, db, receipt_context):
+    ledger, owner, payload, storage = receipt_context
+    response = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                           data={"payload": json.dumps(payload)}, files=receipt_files(3))
+    assert response.status_code == 201, response.text
+    assert response.json()["receipt_urls"] == storage.uploaded
+    assert db.query(Expense).filter_by(id=uuid.UUID(response.json()["id"])).one().receipt_urls == storage.uploaded
+    expenses = client.get(f"/expenses/ledgers/{ledger.id}/expenses")
+    assert expenses.status_code == 200
+    assert expenses.json()[0]["receipt_urls"] == storage.uploaded
+    assert storage.deleted == []
+
+
+def test_receipt_multipart_rejects_four_images_before_upload(client, db, receipt_context):
+    ledger, owner, payload, storage = receipt_context
+    response = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                           data={"payload": json.dumps(payload)}, files=receipt_files(4))
+    assert response.status_code == 400
+    assert storage.uploaded == []
+    assert db.query(Expense).count() == 0
+
+
+def test_receipt_multipart_rejects_non_images_and_large_files(client, receipt_context):
+    ledger, owner, payload, storage = receipt_context
+    for image in [b"not-an-image", b"\xff\xd8\xff" + b"a" * (5 * 1024 * 1024)]:
+        response = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts", data={"payload": json.dumps(payload)},
+                               files=[("files", ("test.jpg", image, "image/jpeg"))])
+        assert response.status_code == 400
+    assert storage.uploaded == []
+
+
+def test_receipt_upload_failure_cleans_partial_uploads_and_does_not_create_bill(client, db, receipt_context):
+    ledger, owner, payload, storage = receipt_context
+    storage.fail_after = 1
+    response = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                           data={"payload": json.dumps(payload)}, files=receipt_files(2))
+    assert response.status_code == 502
+    assert db.query(Expense).count() == 0
+    assert storage.deleted == storage.uploaded
+
+
+def test_receipts_preserved_for_old_edit_payload_and_removed_only_after_success(client, db, receipt_context):
+    ledger, owner, payload, storage = receipt_context
+    created = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(1)).json()
+    receipt_url = created["receipt_urls"][0]
+    response = client.put(f"/expenses/{created['id']}", json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["receipt_urls"] == [receipt_url]
+    assert storage.deleted == []
+    payload["receipt_urls"] = []
+    response = client.put(f"/expenses/{created['id']}", json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["receipt_urls"] == []
+    assert storage.deleted == [receipt_url]
+
+
+def test_receipt_update_counts_existing_images_and_restricts_editor(client, db, receipt_context):
+    from app.utils.deps import get_current_user
+    ledger, owner, payload, storage = receipt_context
+    created = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(3)).json()
+    payload["receipt_urls"] = created["receipt_urls"]
+    response = client.put(f"/expenses/{created['id']}/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(1))
+    assert response.status_code == 400
+    assert len(storage.uploaded) == 3
+    friend = db.query(User).filter_by(email="receipt-friend@example.com").one()
+    app.dependency_overrides[get_current_user] = lambda: friend
+    response = client.put(f"/expenses/{created['id']}/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(1))
+    assert response.status_code == 403
+    assert len(storage.uploaded) == 3
+
+
+def test_receipt_delete_cleans_storage(client, receipt_context):
+    ledger, owner, payload, storage = receipt_context
+    created = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(1)).json()
+    response = client.delete(f"/expenses/{created['id']}")
+    assert response.status_code == 204
+    assert storage.deleted == storage.uploaded
+
+
+def test_receipt_rejects_foreign_url_and_ledger_before_upload(client, db, receipt_context):
+    from app.utils.deps import get_current_user
+    ledger, owner, payload, storage = receipt_context
+    payload["receipt_urls"] = ["https://example.com/foreign.jpg"]
+    response = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                           data={"payload": json.dumps(payload)}, files=receipt_files(1))
+    assert response.status_code == 400
+    assert storage.uploaded == []
+    outsider = make_user(db, "receipt-outsider@example.com", "Outsider")
+    app.dependency_overrides[get_current_user] = lambda: outsider
+    response = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                           data={"payload": json.dumps(payload)}, files=receipt_files(1))
+    assert response.status_code == 403
+    assert storage.uploaded == []
+
+
+def test_receipt_edit_replaces_one_image_and_keeps_others(client, receipt_context):
+    ledger, owner, payload, storage = receipt_context
+    created = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(2)).json()
+    retained, removed = created["receipt_urls"]
+    payload["receipt_urls"] = [retained]
+    response = client.put(f"/expenses/{created['id']}/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(1))
+    assert response.status_code == 200, response.text
+    assert response.json()["receipt_urls"] == [retained, storage.uploaded[-1]]
+    assert storage.deleted == [removed]
+
+
+def test_receipt_failed_edit_keeps_old_bill_and_images(client, db, receipt_context):
+    ledger, owner, payload, storage = receipt_context
+    created = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(1)).json()
+    storage.fail_after = 2
+    payload["receipt_urls"] = []
+    payload["title"] = "Must not be saved"
+    response = client.put(f"/expenses/{created['id']}/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(2))
+    assert response.status_code == 502
+    saved = db.query(Expense).filter_by(id=uuid.UUID(created["id"])).one()
+    assert saved.title == created["title"]
+    assert saved.receipt_urls == created["receipt_urls"]
+    assert storage.deleted == [storage.uploaded[-1]]
+
+
+def test_receipt_cleanup_preserves_images_referenced_by_another_bill(client, receipt_context):
+    ledger, owner, payload, storage = receipt_context
+    created = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(1)).json()
+    payload["receipt_urls"] = created["receipt_urls"]
+    reused = client.post(f"/expenses/ledgers/{ledger.id}/expenses", json=payload)
+    assert reused.status_code == 201, reused.text
+    assert client.delete(f"/expenses/{created['id']}").status_code == 204
+    assert storage.deleted == []
+    assert client.delete(f"/expenses/{reused.json()['id']}").status_code == 204
+    assert storage.deleted == created["receipt_urls"]
+
+
+def test_receipt_download_signs_private_object_for_members_without_changing_saved_urls(client, db, receipt_context):
+    from app.utils.deps import get_current_user
+    ledger, owner, payload, storage = receipt_context
+    created = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(1)).json()
+    url = created["receipt_urls"][0]
+    friend = db.query(User).filter_by(email="receipt-friend@example.com").one()
+    app.dependency_overrides[get_current_user] = lambda: friend
+    response = client.get(f"/expenses/{created['id']}/receipts/download-url", params={"receipt_url": url})
+    assert response.status_code == 200, response.text
+    assert response.json()["expires_in"] == 900
+    assert "q-signature=test" in response.json()["url"]
+    assert response.headers["cache-control"] == "no-store"
+    assert storage.signed == [(url.split("receipts.example.com/", 1)[1], 900)]
+    assert db.query(Expense).filter_by(id=uuid.UUID(created["id"])).one().receipt_urls == [url]
+
+
+def test_receipt_download_rejects_non_members_and_unattached_urls(client, db, receipt_context):
+    from app.utils.deps import get_current_user
+    ledger, owner, payload, storage = receipt_context
+    created = client.post(f"/expenses/ledgers/{ledger.id}/expenses/with-receipts",
+                          data={"payload": json.dumps(payload)}, files=receipt_files(1)).json()
+    endpoint = f"/expenses/{created['id']}/receipts/download-url"
+    assert client.get(endpoint, params={"receipt_url": "https://example.com/image.jpg"}).status_code == 404
+    outsider = make_user(db, "receipt-view-outsider@example.com", "Outsider")
+    app.dependency_overrides[get_current_user] = lambda: outsider
+    assert client.get(endpoint, params={"receipt_url": created["receipt_urls"][0]}).status_code == 403
+    assert storage.signed == []
+    app.dependency_overrides[get_current_user] = lambda: owner
+    assert client.put(f"/expenses/{created['id']}", json={**payload, "receipt_urls": []}).status_code == 200
+    assert client.get(endpoint, params={"receipt_url": created["receipt_urls"][0]}).status_code == 404
+    assert storage.signed == []
+
+
+def test_receipt_download_rejects_an_object_from_another_ledger(receipt_context):
+    from app.services.receipts import receipt_object_key
+    ledger, owner, payload, storage = receipt_context
+    wrong_url = f"https://receipts.example.com/receipts/{uuid.uuid4()}/{owner.id}/{uuid.uuid4()}.jpg"
+    with pytest.raises(HTTPException) as exc_info:
+        receipt_object_key(wrong_url, ledger.id)
+    assert_http_error(exc_info, 400)
+
+
+def test_cos_download_signature_sets_get_method(monkeypatch, receipt_context):
+    import qcloud_cos
+    from app.services.cos import COSService
+    calls = []
+
+    class SigningClient:
+        def __init__(self, config):
+            pass
+
+        def get_presigned_url(self, Method, Bucket, Key, Expired):
+            calls.append((Method, Bucket, Key, Expired))
+            return "https://test.cos.test.myqcloud.com/image.jpg?q-signature=test"
+
+    monkeypatch.setattr(qcloud_cos, "CosS3Client", SigningClient)
+    assert "q-signature" in COSService().get_presigned_url("receipts/image.jpg", expires=900)
+    assert calls == [("GET", "test", "receipts/image.jpg", 900)]
+
+
+@pytest.fixture()
+def confirmation_context(db):
+    owner = make_user(db, "decision-owner@example.com", "Owner")
+    first = make_user(db, "decision-first@example.com", "First")
+    second = make_user(db, "decision-second@example.com", "Second")
+    ledger = make_ledger(db, owner)
+    for user in (first, second):
+        add_member(db, ledger, user)
+    expense = create_expense(ledger.id, ExpenseCreate(
+        title="Editable decisions", total_amount=Decimal("30.00"), expense_date=date.today(),
+        payer_id=owner.id,
+        splits=[ExpenseSplitCreate(user_id=user.id, amount=Decimal("10.00"))
+                for user in (owner, first, second)],
+    ), db=db, current_user=owner)
+    return ledger, expense, owner, first, second
+
+
+def test_confirmed_decision_can_be_changed_to_rejected_while_pending_or_confirmed(db, confirmation_context):
+    ledger, expense, owner, first, second = confirmation_context
+    for status, expected in [("confirmed", ExpenseStatus.PENDING), ("rejected", ExpenseStatus.REJECTED),
+                             ("confirmed", ExpenseStatus.PENDING)]:
+        confirm_expense(expense.id, ConfirmExpenseRequest(status=status), db=db, current_user=first)
+        assert expense.status == expected
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=second)
+    assert expense.status == ExpenseStatus.CONFIRMED
+    for status, expected in [("rejected", ExpenseStatus.REJECTED), ("confirmed", ExpenseStatus.CONFIRMED)]:
+        confirm_expense(expense.id, ConfirmExpenseRequest(status=status), db=db, current_user=first)
+        assert expense.status == expected
+    records = db.query(ExpenseConfirmation).filter_by(expense_id=expense.id).all()
+    assert len(records) == 3
+    assert {row.user_id: row.status for row in records} == {user.id: "confirmed" for user in (owner, first, second)}
+
+
+def test_changing_confirmed_decision_does_not_overwrite_another_rejection(db, confirmation_context):
+    ledger, expense, owner, first, second = confirmation_context
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=first)
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="rejected"), db=db, current_user=second)
+    for status in ("rejected", "confirmed"):
+        confirm_expense(expense.id, ConfirmExpenseRequest(status=status), db=db, current_user=first)
+        assert expense.status == ExpenseStatus.REJECTED
+        assert db.query(ExpenseConfirmation).filter_by(expense_id=expense.id, user_id=second.id).one().status == "rejected"
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=second)
+    assert expense.status == ExpenseStatus.CONFIRMED
+
+
+def test_changed_confirmation_recalculates_flow_and_keeps_recorded_transfers(db, confirmation_context):
+    from app.models import Settlement
+    from app.services.settlement import SettlementCalculator
+    ledger, expense, owner, first, second = confirmation_context
+    for user in (first, second):
+        confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=user)
+    transfer = Settlement(ledger_id=ledger.id, from_user_id=first.id, to_user_id=owner.id, amount=Decimal("10.00"))
+    db.add(transfer)
+    db.commit()
+    before = SettlementCalculator(db, ledger.id).calculate_net_balances()
+    assert before[owner.id] == Decimal("20.00")
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="rejected"), db=db, current_user=first)
+    assert all(value == 0 for value in SettlementCalculator(db, ledger.id).calculate_net_balances().values())
+    assert db.query(Settlement).filter_by(id=transfer.id).one().amount == Decimal("10.00")
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=first)
+    assert SettlementCalculator(db, ledger.id).calculate_net_balances() == before
+    assert db.query(Settlement).count() == 1
+
+
+def test_confirmation_changes_reject_exempt_users_and_removed_members(db, confirmation_context):
+    ledger, expense, owner, first, second = confirmation_context
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=first)
+    with pytest.raises(HTTPException) as exc_info:
+        confirm_expense(expense.id, ConfirmExpenseRequest(status="rejected"), db=db, current_user=owner)
+    assert_http_error(exc_info, 400)
+    member = db.query(LedgerMember).filter_by(ledger_id=ledger.id, user_id=first.id).one()
+    member.status = "removed"
+    db.commit()
+    with pytest.raises(HTTPException) as exc_info:
+        confirm_expense(expense.id, ConfirmExpenseRequest(status="rejected"), db=db, current_user=first)
+    assert_http_error(exc_info, 403)
+    assert db.query(ExpenseConfirmation).filter_by(expense_id=expense.id, user_id=first.id).one().status == "confirmed"
+
+
+def test_confirmation_changes_are_disabled_when_ledger_confirmation_is_off(db, confirmation_context):
+    ledger, expense, owner, first, second = confirmation_context
+    confirm_expense(expense.id, ConfirmExpenseRequest(status="confirmed"), db=db, current_user=first)
+    update_ledger(ledger.id, LedgerUpdate(require_confirmation=False), db=db, current_user=owner)
+    with pytest.raises(HTTPException) as exc_info:
+        confirm_expense(expense.id, ConfirmExpenseRequest(status="rejected"), db=db, current_user=first)
+    assert_http_error(exc_info, 400)
+    assert expense.status == ExpenseStatus.CONFIRMED

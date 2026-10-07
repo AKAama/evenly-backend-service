@@ -102,6 +102,11 @@ class Settings(BaseSettings):
         validation_alias="PUBLIC_APP_BASE_URL",
     )
 
+    # Leave latest version empty until the release is downloadable in App Store.
+    ios_latest_version: str = Field(default="", pattern=r"^(?:[0-9]+(?:\.[0-9]+){0,2})?$", validation_alias="IOS_LATEST_VERSION")
+    ios_update_message: str = Field(default="新版本已发布，建议更新以获得更好的使用体验。", max_length=2000, validation_alias="IOS_UPDATE_MESSAGE")
+    ios_update_remind_after_days: int = Field(default=3, ge=1, le=30, validation_alias="IOS_UPDATE_REMIND_AFTER_DAYS")
+
     # OpenAI-backed voice expense drafts. The key is server-side only.
     openai_api_key: Optional[str] = Field(default=None, validation_alias=AliasChoices("OPENAI_API_KEY", "DASHSCOPE_API_KEY"))
     openai_transcription_model: str
@@ -170,6 +175,9 @@ _YAML_ALIASES = {
     "APNS_PRIVATE_KEY_PATH": "apns_private_key_path",
     "APNS_BUNDLE_ID": "apns_bundle_id",
     "PUBLIC_APP_BASE_URL": "public_app_base_url",
+    "IOS_LATEST_VERSION": "ios_latest_version",
+    "IOS_UPDATE_MESSAGE": "ios_update_message",
+    "IOS_UPDATE_REMIND_AFTER_DAYS": "ios_update_remind_after_days",
 }
 
 

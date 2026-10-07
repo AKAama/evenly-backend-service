@@ -79,6 +79,7 @@ class ExpenseBase(BaseModel):
 
 
 class ExpenseCreate(ExpenseBase):
+    receipt_urls: list[str] = Field(default_factory=list, max_length=3)
     payer_id: UUID
     splits: list[ExpenseSplitCreate]
 
@@ -86,6 +87,7 @@ class ExpenseCreate(ExpenseBase):
 class ExpenseUpdate(ExpenseBase):
     """Full replace for a pending expense (same shape as create body)."""
 
+    receipt_urls: list[str] | None = Field(default=None, max_length=3)
     payer_id: UUID
     splits: list[ExpenseSplitCreate]
 
@@ -93,6 +95,7 @@ class ExpenseUpdate(ExpenseBase):
 class ExpenseResponse(ExpenseBase):
     model_config = ConfigDict(from_attributes=True)
 
+    receipt_urls: list[str] = Field(default_factory=list, max_length=3)
     id: UUID
     ledger_id: UUID
     payer_id: UUID
@@ -115,6 +118,11 @@ class ExpenseRefundRequest(BaseModel):
 
     refund_amount: Decimal
     note: str | None = None
+
+
+class ReceiptDownloadURLResponse(BaseModel):
+    url: str
+    expires_in: int
 
 
 def expense_to_with_details(

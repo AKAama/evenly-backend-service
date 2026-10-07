@@ -92,17 +92,31 @@ class SettlementCalculator:
             .all()
         )
 
-    def users_involved_in_pending_expenses(self) -> set[UUID]:
-        """Registered users on any still-pending bill (payer or split)."""
+    def settlement_id_for_member(self, member: LedgerMember) -> UUID:
+        """Stable identity used by settlement suggestions.
+
+        Registered members keep using their user id for backwards compatibility;
+        temporary members have no user id, so their ledger-member id identifies
+        them in transfer flows.
+        """
+        return member.user_id or member.id
+
+    def members_by_id(self) -> dict[UUID, LedgerMember]:
+        return {member.id: member for member in self.get_ledger_members()}
+
+    def identities_involved_in_pending_expenses(self) -> set[UUID]:
+        """Settlement identities on any still-pending bill (payer or split)."""
         involved: set[UUID] = set()
+        members_by_id = self.members_by_id()
         for expense in self.get_settlement_expenses():
             if expense.status != ExpenseStatus.PENDING:
                 continue
             if expense.payer_id is not None:
                 involved.add(expense.payer_id)
             for split in expense.splits or []:
-                if split.user_id is not None:
-                    involved.add(split.user_id)
+                member = members_by_id.get(split.member_id)
+                if member is not None:
+                    involved.add(self.settlement_id_for_member(member))
         return involved
 
     def get_ledger_members(self) -> list[LedgerMember]:
@@ -120,7 +134,7 @@ class SettlementCalculator:
 
     def calculate_net_balances(self) -> dict[UUID, Decimal]:
         """
-        Calculate net balance for each registered user.
+        Calculate net balance for each active ledger member.
 
         Net contribution = paid - owed (payer paid total, each owes split).
 
@@ -131,15 +145,19 @@ class SettlementCalculator:
         fully-confirmed end state.
         """
         members = self.get_ledger_members()
-        member_ids = {m.user_id for m in members if m.user_id is not None}
-        net_balances: dict[UUID, Decimal] = {uid: Decimal("0") for uid in member_ids}
+        members_by_id = {member.id: member for member in members}
+        net_balances: dict[UUID, Decimal] = {
+            self.settlement_id_for_member(member): Decimal("0")
+            for member in members
+        }
 
         for expense in self.get_settlement_expenses():
             if expense.payer_id in net_balances:
                 net_balances[expense.payer_id] += expense_net_amount(expense)
             for split, amount in expense_scaled_split_amounts(expense):
-                if split.user_id is not None and split.user_id in net_balances:
-                    net_balances[split.user_id] -= amount
+                member = members_by_id.get(split.member_id)
+                if member is not None:
+                    net_balances[self.settlement_id_for_member(member)] -= amount
 
         for uid in list(net_balances.keys()):
             if abs(net_balances[uid]) < Decimal("0.01"):
@@ -150,9 +168,20 @@ class SettlementCalculator:
     def get_user_names(self) -> dict[UUID, str]:
         """Get display names for all ledger members"""
         members = self.get_ledger_members()
-        user_ids = [m.user_id for m in members]
+        user_ids = [m.user_id for m in members if m.user_id is not None]
         users = self.db.query(User).filter(User.id.in_(user_ids)).all()
-        return {u.id: u.display_name or u.email for u in users}
+        users_by_id = {user.id: user for user in users}
+        names: dict[UUID, str] = {}
+        for member in members:
+            identity = self.settlement_id_for_member(member)
+            user = users_by_id.get(member.user_id)
+            names[identity] = (
+                member.display_name
+                or (user.display_name if user is not None else None)
+                or (user.email if user is not None else None)
+                or "Unknown"
+            )
+        return names
 
     def calculate_settlements(self) -> list[dict]:
         """
@@ -171,7 +200,7 @@ class SettlementCalculator:
         """
         net_balances = self.calculate_net_balances()
         user_names = self.get_user_names()
-        pending_users = self.users_involved_in_pending_expenses()
+        pending_users = self.identities_involved_in_pending_expenses()
 
         # Separate into creditors (positive balance) and debtors (negative balance)
         creditors: list[tuple[UUID, Decimal]] = []

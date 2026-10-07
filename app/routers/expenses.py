@@ -4,8 +4,11 @@ import logging
 from time import perf_counter
 from uuid import UUID, uuid4
 from decimal import Decimal
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.encoders import jsonable_encoder
+from starlette.concurrency import run_in_threadpool
+from pydantic import ValidationError
+from app.services.receipts import validate_receipt_urls, image_extension, cleanup_unreferenced_receipts, receipt_object_key, MAX_IMAGE_BYTES
 from sqlalchemy.orm import joinedload, selectinload, Session
 from typing import List
 
@@ -19,6 +22,7 @@ from app.schemas.expense import (
     ExpenseWithDetails,
     ExpenseSplitCreate,
     ExpenseRefundRequest,
+    ReceiptDownloadURLResponse,
     ConfirmExpenseRequest,
     VoiceExpenseDraft,
     expense_to_with_details,
@@ -515,6 +519,7 @@ def create_expense(
     ledger = get_ledger_or_404(db, ledger_id)
     require_ledger_member(db, ledger_id, current_user)
 
+    validate_receipt_urls(expense.receipt_urls, ledger_id, current_user.id)
     resolved_splits, payer_member = _resolve_expense_splits(
         ledger_id=ledger_id,
         payload=expense,
@@ -592,6 +597,7 @@ def _persist_expense_row(
         title=payload.title,
         total_amount=payload.total_amount,
         note=payload.note,
+        receipt_urls=payload.receipt_urls or [],
         category=payload.category,
         icon_type=payload.icon_type,
         icon_value=payload.icon_value,
@@ -672,11 +678,18 @@ def update_expense(
     if expense.status == ExpenseStatus.REJECTED:
         raise HTTPException(status_code=400, detail="Rejected expenses cannot be edited")
 
+    previous_receipts = list(expense.receipt_urls or [])
+    if payload.receipt_urls is not None:
+        validate_receipt_urls(payload.receipt_urls, expense.ledger_id, current_user.id, existing=previous_receipts)
+
     resolved_splits, _payer_member = _resolve_expense_splits(
         ledger_id=expense.ledger_id,
         payload=payload,
         db=db,
     )
+
+    if payload.receipt_urls is not None:
+        expense.receipt_urls = list(payload.receipt_urls)
 
     expense.title = payload.title
     expense.total_amount = payload.total_amount
@@ -739,6 +752,7 @@ def update_expense(
 
     db.commit()
     db.refresh(expense)
+    cleanup_unreferenced_receipts(db, expense.ledger_id, previous_receipts)
 
     recipients = required_participants
     if recipients:
@@ -913,12 +927,15 @@ def confirm_expense(
     x_client: str | None = Header(default=None, alias="X-Client"),
 ):
     """Confirm or reject an expense"""
-    expense = db.query(Expense).filter(Expense.id == expense_id).first()
+    # Serialize responses so concurrent corrections cannot overwrite each other.
+    expense = db.query(Expense).filter(Expense.id == expense_id).with_for_update().first()
     if not expense:
         raise HTTPException(status_code=404, detail="Expense not found")
 
     # Check if user is a member of the ledger
     require_ledger_member(db, expense.ledger_id, current_user)
+    if not _ledger_requires_confirmation(db, expense.ledger_id):
+        raise HTTPException(status_code=400, detail="本账本未开启账单确认")
 
     split_participants = {
         s.user_id
@@ -936,50 +953,45 @@ def confirm_expense(
     if current_user.id not in split_participants:
         raise HTTPException(status_code=403, detail="Only expense participants can confirm this expense")
 
-    # Check if already confirmed or rejected
-    if expense.status != ExpenseStatus.PENDING:
-        raise HTTPException(status_code=400, detail=f"Expense is already {expense.status.value}")
-
-    # Validate status
     if request.status not in ["confirmed", "rejected"]:
         raise HTTPException(status_code=400, detail="Status must be 'confirmed' or 'rejected'")
 
-    # Check if user already confirmed/rejected this expense
     existing = db.query(ExpenseConfirmation).filter(
         ExpenseConfirmation.expense_id == expense_id,
         ExpenseConfirmation.user_id == current_user.id
     ).first()
 
+    # Participants may change only their own explicit decision, in either direction.
     if existing:
-        raise HTTPException(status_code=400, detail="You have already responded to this expense")
+        if existing.status not in {"confirmed", "rejected"} or existing.status == request.status:
+            raise HTTPException(status_code=400, detail="You have already responded to this expense")
+        existing.status = request.status
+    else:
+        if expense.status != ExpenseStatus.PENDING:
+            raise HTTPException(status_code=400, detail=f"Expense is already {expense.status.value}")
+        db.add(ExpenseConfirmation(
+            expense_id=expense_id,
+            user_id=current_user.id,
+            status=request.status,
+        ))
+    db.flush()
 
-    # Create confirmation record
-    confirmation = ExpenseConfirmation(
-        expense_id=expense_id,
-        user_id=current_user.id,
-        status=request.status,
+    required_participants = required_confirmation_user_ids(
+        split_participants,
+        created_by=expense.created_by,
+        payer_id=expense.payer_id,
     )
-    db.add(confirmation)
-    db.flush()  # Flush to get the new confirmation in the query
-
-    # Check if all required participants have confirmed
-    if request.status == "confirmed":
-        confirmations = db.query(ExpenseConfirmation).filter(
-            ExpenseConfirmation.expense_id == expense_id,
-            ExpenseConfirmation.status == "confirmed"
-        ).all()
-        confirmed_ids = {c.user_id for c in confirmations}
-
-        required_participants = required_confirmation_user_ids(
-            split_participants,
-            created_by=expense.created_by,
-            payer_id=expense.payer_id,
-        )
-        if required_participants <= confirmed_ids:
-            expense.status = ExpenseStatus.CONFIRMED
-
-    elif request.status == "rejected":
+    confirmations = db.query(ExpenseConfirmation).filter(
+        ExpenseConfirmation.expense_id == expense_id,
+    ).all()
+    rejected_ids = {c.user_id for c in confirmations if c.status == "rejected"}
+    confirmed_ids = {c.user_id for c in confirmations if c.status == "confirmed"}
+    if required_participants & rejected_ids:
         expense.status = ExpenseStatus.REJECTED
+    elif required_participants <= confirmed_ids:
+        expense.status = ExpenseStatus.CONFIRMED
+    else:
+        expense.status = ExpenseStatus.PENDING
 
     db.commit()
     db.refresh(expense)
@@ -1053,8 +1065,10 @@ def delete_expense(
 
     title = expense.title
     ledger_id = expense.ledger_id
+    receipt_urls = list(expense.receipt_urls or [])
     db.delete(expense)
     db.commit()
+    cleanup_unreferenced_receipts(db, ledger_id, receipt_urls)
     from app.services.audit import record_audit
 
     record_audit(
@@ -1094,4 +1108,126 @@ def get_expense(
         payer=payer,
         splits=splits,
         confirmations=confirmations,
+    )
+
+
+@router.get("/{expense_id}/receipts/download-url", response_model=ReceiptDownloadURLResponse)
+def get_receipt_download_url(
+    expense_id: UUID,
+    receipt_url: str,
+    response: Response,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    expense = db.query(Expense).filter(Expense.id == expense_id).first()
+    if not expense:
+        raise HTTPException(404, "Expense not found")
+    require_ledger_member(db, expense.ledger_id, current_user)
+    if receipt_url not in (expense.receipt_urls or []):
+        raise HTTPException(404, "凭据不存在或已被移除")
+    key = receipt_object_key(receipt_url, expense.ledger_id)
+    from app.services.cos import get_cos_service
+    service = get_cos_service()
+    if service is None:
+        raise HTTPException(503, "图片上传未配置")
+    expires = 900
+    try:
+        url = service.get_presigned_url(key, expires=expires)
+    except Exception as error:
+        logger.exception("获取凭据下载地址失败 expense_id=%s", expense_id)
+        raise HTTPException(502, "凭据暂时无法加载，请重试") from error
+    response.headers["Cache-Control"] = "no-store"
+    return ReceiptDownloadURLResponse(url=url, expires_in=expires)
+
+
+async def _save_with_receipts(ledger_id, payload, files, db, current_user, save):
+    from app.services.cos import get_cos_service
+
+    require_ledger_member(db, ledger_id, current_user)
+    retained = list(payload.receipt_urls or [])
+    if len(retained) + len(files) > 3:
+        raise HTTPException(400, "凭据最多上传 3 张图片")
+    # Validate all files before starting any storage writes.
+    prepared = []
+    for file in files:
+        contents = await file.read(MAX_IMAGE_BYTES + 1)
+        ext = image_extension(contents, file.content_type)
+        prepared.append((contents, ext))
+    uploaded = []
+    try:
+        if prepared:
+            service = get_cos_service()
+            if service is None:
+                raise HTTPException(503, "图片上传未配置")
+            for contents, ext in prepared:
+                try:
+                    url = await run_in_threadpool(
+                        service.upload_file, file_data=contents, filename=f"receipt.{ext}",
+                        folder=f"receipts/{ledger_id}/{current_user.id}",
+                    )
+                except Exception as error:
+                    logger.exception("账单凭据上传失败 ledger_id=%s", ledger_id)
+                    raise HTTPException(502, "凭据图片上传失败，请重试或移除图片后保存") from error
+                uploaded.append(url)
+        payload.receipt_urls = retained + uploaded
+        return await run_in_threadpool(save, payload)
+    except Exception:
+        db.rollback()
+        await run_in_threadpool(cleanup_unreferenced_receipts, db, ledger_id, uploaded)
+        raise
+
+
+def _receipt_payload(raw, schema):
+    try:
+        return schema.model_validate_json(raw)
+    except ValidationError as error:
+        raise HTTPException(422, "账单内容无效，请检查金额、参与人和凭据数量") from error
+
+
+@router.post("/ledgers/{ledger_id}/expenses/with-receipts", response_model=ExpenseResponse, status_code=201)
+async def create_expense_with_receipts(
+    ledger_id: UUID,
+    payload: str = Form(...),
+    files: List[UploadFile] = File(default=[]),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    x_client: str | None = Header(default=None, alias="X-Client"),
+):
+    parsed = _receipt_payload(payload, ExpenseCreate)
+    get_ledger_or_404(db, ledger_id)
+    require_ledger_member(db, ledger_id, current_user)
+    validate_receipt_urls(parsed.receipt_urls, ledger_id, current_user.id)
+    _resolve_expense_splits(ledger_id=ledger_id, payload=parsed, db=db)
+    return await _save_with_receipts(
+        ledger_id, parsed, files, db, current_user,
+        lambda body: create_expense(ledger_id, body, db=db, current_user=current_user, x_client=x_client),
+    )
+
+
+@router.put("/{expense_id}/with-receipts", response_model=ExpenseResponse)
+async def update_expense_with_receipts(
+    expense_id: UUID,
+    payload: str = Form(...),
+    files: List[UploadFile] = File(default=[]),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    parsed = _receipt_payload(payload, ExpenseUpdate)
+    expense = db.query(Expense).filter(Expense.id == expense_id).first()
+    if not expense:
+        raise HTTPException(404, "Expense not found")
+    require_ledger_member(db, expense.ledger_id, current_user)
+    if expense.created_by != current_user.id:
+        raise HTTPException(403, "Only the expense creator can edit this expense")
+    if expense.status == ExpenseStatus.REJECTED or (
+        _ledger_requires_confirmation(db, expense.ledger_id) and expense.status != ExpenseStatus.PENDING
+    ):
+        raise HTTPException(400, "当前账单状态不允许编辑")
+    if parsed.receipt_urls is None:
+        parsed.receipt_urls = list(expense.receipt_urls or [])
+    validate_receipt_urls(parsed.receipt_urls, expense.ledger_id, current_user.id, existing=expense.receipt_urls or [])
+    _resolve_expense_splits(ledger_id=expense.ledger_id, payload=parsed, db=db)
+    return await _save_with_receipts(
+        expense.ledger_id, parsed, files, db, current_user,
+        lambda body: update_expense(expense_id, body, db=db, current_user=current_user),
     )

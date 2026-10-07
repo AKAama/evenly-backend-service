@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.6 — 2026-10-08
+
+- 新增账单图片凭据，最多 3 张；支持创建、编辑、清理及成员授权下载。数据库迁移：`20261007_0026`。
+- 参与成员可修改自己的确认或拒绝状态，包括账单整体已确认的情况；重新计算整体状态与结算流向。
+- 修复临时成员未计入结算流向的问题，以及 COS 下载链接签名缺少 GET 方法的问题。
+- 新增公开 iOS 更新提醒接口，按已发布版本读取从 App JSON 同步的文案，未上架版本默认不提醒。
+
 ## 2026-07-18 — Admin password reset
 
 - Platform admin: `POST /admin/users/{id}/reset-password` sets a new password (min 6) without old password; audited as `user.password_reset_admin`.
