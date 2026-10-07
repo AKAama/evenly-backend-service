@@ -38,6 +38,9 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # This ACR registry rejects OCI attestation manifests.
+          provenance: false
+          sbom: false
           tags: crpi-3xux8vqn35fw00z9.cn-shanghai.personal.cr.aliyuncs.com/project_hub/evenly-backend-service:${{ steps.ver.outputs.tag }}
 
       - name: Deploy on server
